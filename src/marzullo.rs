@@ -130,34 +130,171 @@ fn insertion_sort(tuples: &mut [Tuple]) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_empty_input() {
-        let mut tuples: Vec<Tuple> = vec![];
-        let result = Marzullo::smallest_interval(&mut tuples);
-        assert_eq!(result.lower_bound, 0);
-        assert_eq!(result.upper_bound, 0);
-        assert_eq!(result.sources_true, 0);
-        assert_eq!(result.sources_false, 0);
+    fn test_smallest_interval(bounds: &[i64], expected: Interval) {
+        let mut tuples = Vec::new();
+        for (i, &bound) in bounds.iter().enumerate() {
+            tuples.push(Tuple {
+                source: (i / 2) as u8,
+                offset: bound,
+                bound: if i % 2 == 0 {
+                    Bound::Lower
+                } else {
+                    Bound::Upper
+                },
+            });
+        }
     }
 
     #[test]
-    fn test_single_source() {
-        let mut tuples = vec![
-            Tuple {
-                source: 0,
-                offset: 10,
-                bound: Bound::Lower,
+    fn test_three_overlapping_sources() {
+        test_smallest_interval(
+            &[11, 13, 10, 12, 8, 12],
+            Interval {
+                lower_bound: 11,
+                upper_bound: 12,
+                sources_true: 3,
+                sources_false: 0,
             },
-            Tuple {
-                source: 0,
-                offset: 20,
-                bound: Bound::Upper,
+        );
+    }
+
+    #[test]
+    fn test_partial_overlap() {
+        test_smallest_interval(
+            &[8, 12, 11, 13, 14, 15],
+            Interval {
+                lower_bound: 11,
+                upper_bound: 12,
+                sources_true: 2,
+                sources_false: 1,
             },
-        ];
-        let result = Marzullo::smallest_interval(&mut tuples);
-        assert_eq!(result.lower_bound, 10);
-        assert_eq!(result.upper_bound, 20);
-        assert_eq!(result.sources_true, 1);
-        assert_eq!(result.sources_false, 0);
+        );
+    }
+
+    #[test]
+    fn test_point_intersection() {
+        test_smallest_interval(
+            &[-10, 10, -1, 1, 0, 0],
+            Interval {
+                lower_bound: 0,
+                upper_bound: 0,
+                sources_true: 3,
+                sources_false: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_inclusive_overlap() {
+        // The upper bound of the first interval overlaps inclusively with the lower of the last.
+        test_smallest_interval(
+            &[8, 12, 10, 11, 8, 10],
+            Interval {
+                lower_bound: 10,
+                upper_bound: 10,
+                sources_true: 3,
+                sources_false: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_tie_breaking_first_smallest() {
+        // The first smallest interval is selected. The alternative with equal overlap is 10..12.
+        // However, while this shares the same number of sources, it is not the smallest interval.
+        test_smallest_interval(
+            &[8, 12, 10, 12, 8, 9],
+            Interval {
+                lower_bound: 8,
+                upper_bound: 9,
+                sources_true: 2,
+                sources_false: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn test_tie_breaking_last_smallest() {
+        // The last smallest interval is selected. The alternative with equal overlap is 7..9.
+        // However, while this shares the same number of sources, it is not the smallest interval.
+        test_smallest_interval(
+            &[7, 9, 7, 12, 10, 11],
+            Interval {
+                lower_bound: 10,
+                upper_bound: 11,
+                sources_true: 2,
+                sources_false: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn test_negative_offsets() {
+        // The same idea as the previous test, but with negative offsets.
+        test_smallest_interval(
+            &[-9, -7, -12, -7, -11, -10],
+            Interval {
+                lower_bound: -11,
+                upper_bound: -10,
+                sources_true: 2,
+                sources_false: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn test_empty_cluster() {
+        // A cluster of one with no remote sources.
+        test_smallest_interval(
+            &[],
+            Interval {
+                lower_bound: 0,
+                upper_bound: 0,
+                sources_true: 0,
+                sources_false: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_single_remote_source() {
+        // A cluster of two with one remote source.
+        test_smallest_interval(
+            &[1, 3],
+            Interval {
+                lower_bound: 1,
+                upper_bound: 3,
+                sources_true: 1,
+                sources_false: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_two_sources_agreement() {
+        // A cluster of three with agreement.
+        test_smallest_interval(
+            &[1, 3, 2, 2],
+            Interval {
+                lower_bound: 2,
+                upper_bound: 2,
+                sources_true: 2,
+                sources_false: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_two_sources_no_agreement() {
+        // A cluster of three with no agreement, still returns the smallest interval.
+        test_smallest_interval(
+            &[1, 3, 4, 5],
+            Interval {
+                lower_bound: 4,
+                upper_bound: 5,
+                sources_true: 1,
+                sources_false: 1,
+            },
+        );
     }
 }

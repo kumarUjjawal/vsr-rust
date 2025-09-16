@@ -1,0 +1,9 @@
+use std::{fmt, time};
+
+use crate::config;
+pub const NS_PER_MS: u64 = 1_000_000;
+
+const CLOCK_OFFSET_TOLERANCE_MAX: u64 = config::CLOCK_OFFSET_TOLERANT_MAX_MS * NS_PER_MS;
+const EPOCH_MAX: u64 = config::CLOCK_EPOCH_MAX_MS * NS_PER_MS;
+const WINDOW_MIN: u64 = config::CLOCK_SYNCHRONIZATION_WINDOWN_MIN_MS * NS_PER_MS;
+const WINDOW_MAX: u64 = config::CLOCK_SYNCHRONIZATION_WINDOWN_MAX_MS * NS_PER_MS;

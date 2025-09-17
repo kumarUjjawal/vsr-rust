@@ -1,16 +1,16 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interval {
-    lower_bound: i64,
-    upper_bound: i64,
-    sources_true: u8,
-    sources_false: u8,
+    pub lower_bound: i64,
+    pub upper_bound: i64,
+    pub sources_true: u8,
+    pub sources_false: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuple {
-    source: u8,
-    offset: i64,
-    bound: Bound,
+    pub source: u8,
+    pub offset: i64,
+    pub bound: Bound,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]

@@ -42,9 +42,9 @@ pub const CONNECTION_SEND_QUEUE_MAX_REPLICA: usize = {
     }
 };
 
-pub const CONNECTION_SEND_QUEUE_MAX_CLIENT: i32 = 2;
+pub const CONNECTION_SEND_QUEUE_MAX_CLIENT: usize = 2;
 
-pub const CLIENT_REQUEST_QUEUE_MAX: u8 = 32;
+pub const CLIENT_REQUEST_QUEUE_MAX: usize = 32;
 
 pub const TCP_BACKLOG: u8 = 64;
 
@@ -65,12 +65,12 @@ pub const TCP_USER_TIMEOUT: i32 = (TCP_KEEPIDLE * TCP_KEEPINTVL * TCP_KEEPCNT) *
 
 pub const TCP_NODELAY: bool = true;
 
-pub const SECTOR_SIZE: i32 = 4096;
+pub const SECTOR_SIZE: usize = 4096;
 
 pub const DIRECT_IO: bool = true;
 
-pub const IO_DEPTH_READ: u8 = 8;
-pub const IO_DEPTH_WRITE: u8 = 8;
+pub const IO_DEPTH_READ: usize = 8;
+pub const IO_DEPTH_WRITE: usize = 8;
 
 pub const TICK_MS: u16 = 10;
 

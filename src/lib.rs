@@ -1,3 +1,4 @@
+mod client;
 mod clock;
 mod config;
 mod fifo;

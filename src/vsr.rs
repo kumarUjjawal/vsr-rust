@@ -77,3 +77,5 @@ impl Default for Header {
         }
     }
 }
+
+pub struct TimeOut;

@@ -39,10 +39,10 @@ pub enum ProcessType {
 }
 
 pub struct Message {
-    header: Header,
-    buffer: Vec<u8>,
-    references: u32,
-    next: Option<Box<Message>>,
+    pub header: Header,
+    pub buffer: Vec<u8>,
+    pub references: u32,
+    pub next: Option<Box<Message>>,
 }
 
 impl Message {

@@ -76,6 +76,8 @@ pub const TICK_MS: u16 = 10;
 
 pub const RTT_TICKS: u16 = 300 / TICK_MS;
 
+pub const RTT_MULTIPLE: u16 = 2;
+
 pub const BACKOFF_MIN_TICKS: u16 = 100 / TICK_MS;
 
 pub const BACKOFF_MAX_TICKS: u16 = 1000 / TICK_MS;

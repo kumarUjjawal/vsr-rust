@@ -42,7 +42,7 @@ where
 
     pub view: u32,
 
-    pub request_queue: RingBuffer<Request<SM>, config::CLIENT_REQUEST_QUEUE_MAX>,
+    pub request_queue: RingBuffer<Request<SM>, {config::CLIENT_REQUEST_QUEUE_MAX}>,
 
     pub request_timeout: vsr::TimeOut,
 
@@ -372,12 +372,12 @@ where
         let message = self.message_bus.get_message();
 
         message.header = {
-            client = self.id,
-            request = self.request_number,
-            cluster = self.cluster,
-            command = request,
-            operation = register,
-        }
+            self.client  = self.id;
+            self.request = self.request_number;
+            self.cluster = self.cluster;
+            self.command = request;
+            self.operation = register;
+        };
 
         assert!(self.request_number == 0);
         self.request_number += 1;

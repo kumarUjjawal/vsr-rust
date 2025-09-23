@@ -1,10 +1,7 @@
-mod client;
-mod clock;
 mod config;
 mod fifo;
-mod marzullo;
 mod message_pool;
 mod ring_buffer;
-mod state_machine;
-mod types;
+mod test;
+mod vpr;
 mod vsr;

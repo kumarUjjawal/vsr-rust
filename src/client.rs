@@ -1,11 +1,11 @@
-use std::intrinsics::round_ties_even_f16;
-
 use crate::{
     config,
-    message_pool::{self, Message},
-    ring_buffer::{self, RingBuffer},
-    vsr::{self, Header, Operation},
+    message_pool::Message,
+    ring_buffer::RingBuffer,
+    state_machine::{Operation, StateMachine},
+    vsr::{self, Header},
 };
+use std::mem;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -226,4 +226,220 @@ where
             self.id
         );
     }
+
+    fn on_pong(&mut self, pong: &mut Message) {
+        assert!(pong.header.command == pong);
+        assert!(pong.header.cluster == self.cluster);
+
+        if pong.header != 0 {
+            log::debug!("{}: on_pong: ignoring (client != 0)", self.id);
+            return;
+        }
+
+        if pong.header.view > self.view {
+            log::debug!(
+                "{}: on_pong: newer view={}..{}",
+                self.id,
+                self.view,
+                pong.header.view
+            );
+            self.view = pong.header.view;
+        }
+
+        self.register()
+    }
+
+    fn on_reply(&mut self, reply: &mut Message) {
+        assert!(reply.header.valid_checksum());
+        assert!(reply.header.valid_checksum_body(reply.body()));
+
+        if reply.header.client != self.id {
+            log::debug!(
+                "{}: on_reply: ignoring (wrong client = {})",
+                self.id,
+                reply.header.client
+            );
+            return;
+        }
+
+        if let Some(inflight) = self.request_queue.head_ptr() {
+            if reply.header.request < inflight.messsage.header.request {
+                log::debug!(
+                    "{}: on_reply: ignoring (wrong client={}",
+                    self.id,
+                    self.header.client
+                );
+                return;
+            }
+        } else {
+            log::debug!("{}: on_reply: ignoring (on inflight request)", self.id);
+            return;
+        }
+
+        let inflight = self.request_queue.pop().unwrap();
+
+        log::debug!(
+            "{}: on_reply: user_data={} request={} size={}",
+            self.id,
+            inflight.user_data,
+            reply.header.request,
+            reply.header.size,
+        );
+
+        assert!(reply.header.parent == self.parent);
+        assert!(reply.header.client == self.id);
+        assert!(reply.header.context == 0);
+        assert!(reply.header.request == inflight.message.header.request);
+        assert!(reply.header.cluster == self.cluster);
+        assert!(reply.header.op == reply.header.commit);
+        assert!(reply.header.operation == inflight.message.header.operation);
+
+        self.parent = reply.header.checksum;
+
+        if reply.header.view > self.view {
+            log::debug!(
+                "{}: on_reply: newer view={}..{}",
+                self.id,
+                self.view,
+                reply.header.view
+            );
+            self.view = reply.header.view;
+        }
+
+        self.request_timeout.stop();
+
+        if inflight.message.header.operation == Operation::Register {
+            assert!(self.session == 0);
+            assert!(reply.header.commit > 0);
+            self.session = reply.header.commit;
+        }
+    }
+
+    fn on_ping_timeout(&mut self) {
+        self.ping_timeout.reset();
+
+        let ping = Header {
+            command: self.ping,
+            cluster: self.cluster,
+            client: self.id,
+            ..Default::default()
+        };
+
+        self.send_header_to_replicas(ping);
+    }
+
+    fn on_request_timeout(&mut self) {
+        self.request_timeout.backoff(self.prng.random());
+
+        let message = self.request_queue.head_ptr().message;
+        assert!(message.header.command == request);
+        assert!(message.header.request <= self.request_number);
+        assert!(message.header.checksum == self.parent);
+        assert!(message.header.context == self.session);
+
+        log::debug!(
+            "{}: on_request_timeout: resending request={} checksum={}",
+            self.id,
+            message.header.request,
+            message.header.checksum
+        );
+
+        self.send_message_to_replica(
+            self.view + self.request_timeout.attempt % self.replica_count,
+            message,
+        );
+    }
+
+    fn create_mesage_from_header(&mut self, header: Header) -> &mut Message {
+        assert!(header.client == self.id);
+        assert!(header.cluster == self.cluster);
+        assert!(header.size == mem::size_of::<Header>);
+
+        let message = self.message_bus.pool.get_message();
+
+        message.header = header;
+        message.header.set_checksum_body(message.body());
+        message.header.set_checksume();
+
+        return message;
+    }
+
+    fn register(&mut self) {
+        if self.request_number > 0 {
+            return;
+        }
+
+        let message = self.message_bus.get_message();
+
+        message.header = {
+            client = self.id,
+            request = self.request_number,
+            cluster = self.cluster,
+            command = request,
+            operation = register,
+        }
+
+        assert!(self.request_number == 0);
+        self.request_number += 1;
+
+        log::debug!("{}: register: registering a session with the cluster", self.id);
+
+        assert!(self.request_queue.empty());
+
+        self.request_queue.push_assume_capacity() {
+            user_data = 0,
+            callback = undefined,
+            message = message.as_ref(),
+        }
+
+        self.send_request_for_the_first_time(message);
+    }
+
+    fn send_header_to_replica(&mut self, replica: u8, header: Header) {
+        let message = self.create_message_from_header(header);
+        self.send_message_to_replica(replica, message);
+    }
+
+    fn send_header_to_replicas(&mut self, header: Header) {
+        let message = self.create_message_from_header(header);
+
+        let mut replica: u8 = 0;
+        while replica < self.replica_count {
+            replica += 1;
+            self.send_message_to_replica(replica, message);
+        }
+    }
+
+    fn send_message_to_replica(&mut self, replica: u8, message: &Message) {
+        log::debug!("{}: sending {:?} to replica {}: {}", self.id, message.header.command, replica, message.header);
+
+        assert!(replica < self.replica_count);
+        assert!(message.header.valid_checksum());
+        assert!(message.header.client == self.id);
+        assert!(message.header.cluster == self.cluster);
+
+        self.message_bus.send_message_to_replica(replica, message);
+    }
+
+
+    fn send_request_for_the_first_time(&mut self, message: &Message) {
+        assert!(self.request_queue.head_ptr().message == message);
+
+        message.header.parent = self.parent;
+        message.header.context = self.session;
+
+        message.header.view = self.view;
+        message.header.set_checksum_body(message.body());
+        message.header.set_checksum();
+
+        self.parent = message.header.checksum;
+
+        log::debug!("{}: send_request_for_the_first_time: request={} checksum={}", self.id, message.header.request, message.header.checksum);
+
+        assert!(!self.request_timeout.ticking);
+        self.request_timeout.start();
+
+        self.send_message_to_replica(self.view % self.replica_count, message);
+    }
+
 }

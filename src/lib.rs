@@ -1,7 +1,7 @@
 mod config;
-mod fifo;
 mod message_pool;
 mod ring_buffer;
-mod test;
+mod services;
+mod sim;
 mod vpr;
 mod vsr;

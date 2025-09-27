@@ -41,7 +41,7 @@ pub enum ProcessType {
 
 #[repr(align(4096))]
 pub struct Message {
-    buffer: [u8; MESSAGE_SIZE_MAX_PADDED],
+    pub buffer: [u8; MESSAGE_SIZE_MAX_PADDED],
 }
 
 impl Message {
@@ -79,8 +79,8 @@ impl Message {
 /// back to the pool for reuse, preventing new memory allocations.
 pub struct PooledMessage {
     // This must not be dropped normally, as we are returning it to the pool.
-    message: std::mem::ManuallyDrop<Box<Message>>,
-    pool: MessagePool,
+    pub message: std::mem::ManuallyDrop<Box<Message>>,
+    pub pool: MessagePool,
 }
 
 impl Deref for PooledMessage {

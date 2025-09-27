@@ -25,7 +25,7 @@ pub trait StateMachine: Send + Sync {
 }
 
 #[derive(Debug)]
-pub struct StorageError(String);
+pub struct StorageError(pub String);
 
 #[async_trait]
 pub trait Storage: Send + Sync {

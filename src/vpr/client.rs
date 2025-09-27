@@ -2,9 +2,10 @@ use crate::{
     config,
     message_pool::Message,
     ring_buffer::RingBuffer,
-    state_machine::{Operation, StateMachine},
+    sim::state_machine::{Operation, StateMachine},
     vsr::{self, Header},
 };
+use crate::services::MessageBus;
 use std::mem;
 
 #[derive(Debug)]

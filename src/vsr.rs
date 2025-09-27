@@ -1,3 +1,4 @@
+use crate::config;
 use std::mem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,3 +621,14 @@ impl Header {
 }
 
 pub struct TimeOut;
+
+/// Calculates the size of a buffer rounded up to the nearest sector size.
+pub fn sector_ceil(size: u64) -> u64 {
+    (size + config::SECTOR_SIZE as u64 - 1) / config::SECTOR_SIZE as u64
+        * config::SECTOR_SIZE as u64
+}
+
+/// Calculates the offset rounded down to the nearest sector boundary.
+pub fn sector_floor(offset: u64) -> u64 {
+    (offset / config::SECTOR_SIZE as u64) * config::SECTOR_SIZE as u64
+}

@@ -1,4 +1,4 @@
-use crate::{message_pool::MessagePool, test::network::Network, vsr::ProcessType};
+use crate::{message_pool::MessagePool, sim::network::Network, vsr::ProcessType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Process {

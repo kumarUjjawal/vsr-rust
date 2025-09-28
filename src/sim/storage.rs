@@ -23,7 +23,7 @@ pub struct FaultyAreas {
     pub period: u64,
 }
 
-/// A simulated storage implementation that implementes the `Storage` trait.
+/// A simulated storage implementation that implements the `Storage` trait.
 /// It uses an in-memory vector as a disk and simulates latency and faults.
 pub struct SimulatedStorage {
     memory: Mutex<Vec<u8>>,
@@ -45,11 +45,10 @@ impl SimulatedStorage {
         }
     }
 
-    async fn simulated_latency(&self, min: u64, mean: u64) {
-        if mean == 0 {
+    async fn simulate_latency(&self, min: u64, mean: u64) {
+        if mean == 0 || mean <= min {
             return;
         }
-
         let exp = Exp::new(1.0 / (mean - min) as f64).unwrap();
         let delay = min as f64 + self.prng.lock().unwrap().sample(exp);
         sleep(Duration::from_millis(delay as u64)).await;
@@ -58,9 +57,8 @@ impl SimulatedStorage {
     fn x_in_100(&self, x: u8) -> bool {
         assert!(x <= 100);
         if x == 0 {
-            return None.is_some();
+            return false;
         }
-
         self.prng.lock().unwrap().random_range(0..100) < x
     }
 
@@ -85,8 +83,8 @@ impl SimulatedStorage {
     fn assert_bounds_and_alignment(&self, buffer: &[u8], offset: u64) {
         assert!(buffer.len() > 0);
         assert_eq!(buffer.len() % config::SECTOR_SIZE, 0);
-        assert_eq!(offset & config::SECTOR_SIZE as u64, 0);
-        assert_eq!(buffer.as_ptr() as usize & config::SECTOR_SIZE, 0);
+        assert_eq!(offset % config::SECTOR_SIZE as u64, 0);
+        assert_eq!(buffer.as_ptr() as usize % config::SECTOR_SIZE, 0);
 
         let mem = self.memory.lock().unwrap();
         assert!(offset as usize + buffer.len() <= mem.len());
@@ -98,7 +96,7 @@ impl Storage for SimulatedStorage {
     async fn read_sectors(&self, buffer: &mut [u8], offset: u64) -> Result<(), StorageError> {
         self.assert_bounds_and_alignment(buffer, offset);
 
-        self.simulated_latency(
+        self.simulate_latency(
             self.options.read_latency_min,
             self.options.read_latency_mean,
         )
@@ -115,12 +113,17 @@ impl Storage for SimulatedStorage {
                 self.prng.lock().unwrap().fill_bytes(faulty_slice);
             }
         }
+
+        let disk_slice = &mem[offset as usize..offset as usize + len];
+        buffer.copy_from_slice(disk_slice);
+
+        Ok(())
     }
 
     async fn write_sectors(&self, buffer: &[u8], offset: u64) -> Result<(), StorageError> {
         self.assert_bounds_and_alignment(buffer, offset);
 
-        self.simulated_latency(
+        self.simulate_latency(
             self.options.write_latency_min,
             self.options.write_latency_mean,
         )

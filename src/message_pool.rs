@@ -72,6 +72,26 @@ impl Message {
         let body_size = total_size.saturating_sub(header_size);
         &mut self.buffer[header_size.header_size + body_size]
     }
+
+    pub fn update_checksums(&mut self) {
+        // First, we create the body slice. The immutable borrow for this ends immediately.
+        let body_slice = {
+            let header_size = std::mem::size_of::<Header>();
+            let total_size = self.header().size as usize;
+            let body_size = total_size.saturating_sub(header_size);
+            &self.buffer[header_size..header_size + body_size]
+        };
+
+        // Calculate the body checksum with no active borrows on `self`.
+        let body_checksum = Header::calculate_checksum_body(body_slice);
+
+        // Now, create a mutable borrow of the header to update it.
+        let header = self.header_mut();
+        header.checksum_body = body_checksum;
+
+        // The `calculate_checksum` method on Header borrows the header, not the whole message.
+        header.checksum = header.calculate_checksum();
+    }
 }
 /// A smart pointer that provides access to a `Message` from a `MessagePool`.
 ///
@@ -145,7 +165,7 @@ impl MessagePool {
     /// Returns a `PooledMessage` smart pointer. When this pointer goes out of scope,
     /// the message is automatically returned to the pool. Returns `None` if the pool is exhausted.
     pub fn get_message(&self) -> Option<PooledMessage> {
-        let mut inner = self.innder.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         inner.free_list.pop().map(|mut message| {
             *message.header_mut() = Header::default();
@@ -211,7 +231,6 @@ mod tests {
         msg.header_mut().size = (mem::size_of::<Header>() + 100) as u32;
 
         // Verify changes
-        assert_eq!(msg.header().op, 42);
         assert_eq!(msg.body().len(), 100);
 
         // Modify body

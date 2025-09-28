@@ -8,13 +8,13 @@ fn exponential_backoff_with_jitter(rng: &mut impl Rng, min: u64, max: u64, attem
         return min;
     }
 
-    let exponent = attempt as u32;
+    let exponent = attempt as u64;
     let power = 2u64.saturating_sub(exponent);
     let min_nonzero = std::cmp::max(1, min);
 
     let backoff = std::cmp::min(range, min_nonzero.saturating_mul(power));
     let jitter = if backoff > 0 {
-        rng.gen_range(0..=backoff);
+        rng.random_range(0..=backoff)
     } else {
         0
     };
@@ -24,14 +24,14 @@ fn exponential_backoff_with_jitter(rng: &mut impl Rng, min: u64, max: u64, attem
 
 #[derive(Debug)]
 pub struct Timeout {
-    name: &'static str,
-    id: u128,
-    after: u64,
-    attempts: u8,
-    rtt: u64,
-    rtt_multiple: u8,
-    ticks: u64,
-    ticking: bool,
+    pub name: &'static str,
+    pub id: u128,
+    pub after: u64,
+    pub attempts: u8,
+    pub rtt: u64,
+    pub rtt_multiple: u8,
+    pub ticks: u64,
+    pub ticking: bool,
 }
 
 impl Timeout {
@@ -49,19 +49,19 @@ impl Timeout {
     }
 
     pub fn start(&mut self) {
-        self.attempt = 0;
+        self.attempts = 0;
         self.ticks = 0;
         self.ticking = true;
     }
 
     pub fn stop(&mut self) {
-        self.attempt = 0;
+        self.attempts = 0;
         self.ticks = 0;
         self.ticking = false;
     }
 
     pub fn reset(&mut self) {
-        self.attempt = 0;
+        self.attempts = 0;
         self.ticks = 0;
         assert!(self.ticking, "Cannot reset a stopped timeout");
     }
@@ -91,12 +91,12 @@ impl Timeout {
         self.ticks = 0;
         self.attempts = self.attempts.wrapping_add(1);
 
-        let base_duration = self.rtt * self.rtt_multiple as u64;
-        let backoff_duration = exponential_backoff_with_jitter(
+        let _base_duration = self.rtt * self.rtt_multiple as u64;
+        let _backoff_duration = exponential_backoff_with_jitter(
             rng,
             config::BACKOFF_MIN_TICKS as u64,
             config::BACKOFF_MAX_TICKS as u64,
-            self.attempt,
+            self.attempts,
         );
     }
 }

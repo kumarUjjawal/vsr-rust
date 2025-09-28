@@ -1,3 +1,4 @@
+use crate::message_pool::{Message, PooledMessage};
 use crate::{message_pool::MessagePool, sim::network::Network, vsr::ProcessType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6,7 +7,7 @@ pub enum Process {
     Client(u128),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageBus {
     network: Network,
     pool: MessagePool,

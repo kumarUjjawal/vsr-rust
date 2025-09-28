@@ -1,70 +1,59 @@
-use crate::{
-    config,
-    message_pool::Message,
-    ring_buffer::RingBuffer,
-    sim::state_machine::{Operation, StateMachine},
-    vsr::{self, Header},
-};
+use crate::config;
+use crate::message_pool::MessagePool;
+use crate::message_pool::{Message, PooledMessage};
+use crate::ring_buffer::RingBuffer;
 use crate::services::MessageBus;
-use std::mem;
+use crate::timeout::Timeout;
+use crate::vsr::{Command, Header, Operation};
+use rand::prelude::*;
+use std::fmt::Debug;
+use std::sync::Arc;
 
-#[derive(Debug)]
+pub type RequestCallback = Box<dyn FnOnce(u128, Operation, Result<&[u8], ClientError>) + Send>;
+
+/// An item in the client's internal request queue.
+struct Request {
+    user_data: u128,
+    callback: RequestCallback,
+    message: PooledMessage,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ClientError {
     TooManyOutstandingRequests,
 }
 
-#[derive(Debug)]
-pub struct Request<SM> {
-    pub user_data: u128,
-    pub callback: fn(u128, SM::Operation, Result<&[u8]>, ClientError),
-    pub message: Message,
+pub struct Client<MB: MessageBus> {
+    message_bus: Arc<MB>,
+    message_pool: MessagePool,
+    id: u128,
+    cluster: u32,
+    replica_count: u8,
+    ticks: u64,
+    parent: u128,
+    session: u64,
+    request_number: u32,
+    view: u32,
+    request_queue: RingBuffer<Request, { config::CLIENT_REQUEST_QUEUE_MAX }>,
+    request_timeout: Timeout,
+    ping_timeout: Timeout,
+    prng: StdRng,
 }
 
-pub struct Client<SM, MB>
-where
-    SM: StateMachine,
-    MB: MessageBus,
-{
-    pub message_bus: MB,
-
-    pub id: u128,
-
-    pub cluster: u32,
-
-    pub replica_count: u8,
-
-    pub ticks: u64,
-
-    pub parent: u128,
-
-    pub session: u64,
-
-    pub request_number: u32,
-
-    pub view: u32,
-
-    pub request_queue: RingBuffer<Request<SM>, {config::CLIENT_REQUEST_QUEUE_MAX}>,
-
-    pub request_timeout: vsr::TimeOut,
-
-    pub ping_timeout: vsr::TimeOut,
-
-    pub prng: rand::rngs::StdRng,
-}
-
-impl<SM, MB> Client<SM, MB>
-where
-    SM: StateMachine,
-    MB: MessageBus,
-{
+impl<MB: MessageBus + Debug + 'static> Client<MB> {
     pub fn new(
+        message_bus: Arc<MB>,
+        message_pool: MessagePool,
         id: u128,
         cluster: u32,
         replica_count: u8,
-        message_bus: MB,
-    ) -> Result<Self, ClientError> {
+    ) -> Self {
+        assert!(id > 0, "Client ID must not be zero");
+        assert!(replica_count > 0, "Replica count must be positive");
+
         let mut client = Self {
             message_bus,
+            message_pool,
             id,
             cluster,
             replica_count,
@@ -74,100 +63,41 @@ where
             request_number: 0,
             view: 0,
             request_queue: RingBuffer::new(),
-            request_timeout: vsr::TimeOut::new(
+            request_timeout: Timeout::new(
                 "request_timeout",
                 id,
-                config::RTT_TICKS * config::RTT_MULTIPLE,
+                (config::RTT_TICKS * config::RTT_MULTIPLE) as u64,
             ),
-            ping_timeout: vsr::TimeOut::new("ping_timeout", id, 3000 / config::TICK_MS),
-            prng: rand::rngs::StdRng::seed_from_u64(id as u64),
+            ping_timeout: Timeout::new("ping_timeout", id, 30000 / config::TICK_MS as u64),
+            prng: StdRng::seed_from_u64(id as u64),
         };
-    }
-
-    pub fn on_message(&self, message: &Message) {
-        log::debug!("{}: on_message: {}", self.id, message.header());
-
-        if let Some(reason) = message.header.invalid() {
-            log::debug!("{}: on_message: invalid ({})", self.id, reason);
-            return;
-        }
-
-        if message.header.cluster == self.cluster {
-            log::warn!(
-                "{}: on_message: wrong cluster (cluster should be {}, not {})",
-                self.id,
-                self.cluster,
-                message.header.cluster
-            );
-            return;
-        }
-
-        match message.header.command {
-            vsr::Command::Pong => self.on_pong(message),
-            vsr::Command::Reply => self.on_reply(message),
-            vsr::Command::Eviction => self.on_eviction(message),
-            _ => {
-                log::warn!(
-                    "{}: on_message: ignoring misdirection {:?} message",
-                    self.id,
-                    message.header.command
-                );
-                return;
-            }
-        }
-    }
-
-    pub fn tick(&self) {
-        self.ticks += 1;
-
-        self.message_bus.tick();
-
-        self.ping_timeout.tick();
-
-        self.request_timeout.tick();
-
-        if self.ping_timeout.fired() {
-            self.on_ping_timeout();
-        }
-
-        if self.request_timeout.fired() {
-            self.on_request_timeout();
-        }
+        client.ping_timeout.start();
+        client
     }
 
     pub fn request(
         &mut self,
         user_data: u128,
-        callback: fn(u128, SM::Operation, Result<&[u8], ClientError>),
-        operation: SM::Operation,
-        message: &mut Message,
+        callback: RequestCallback,
+        operation: Operation,
+        mut message: PooledMessage,
         message_body_size: usize,
     ) {
-        self.register();
+        self.register_if_needed();
 
-        message.header = Header {
-            client: self.id,
-            request: self.request_number,
-            cluster: self.cluster,
-            command: vsr::Command::Request,
-            operation: Operation::from_state_machine(operation),
-            size: (std::mem::size_of::<Header>() + message_body_size) as u32,
-            ..Default::default()
-        };
+        {
+            let header = message.header_mut();
+            header.client = self.id;
+            header.request = self.request_number;
+            header.cluster = self.cluster;
+            header.command = Command::Request;
+            header.operation = operation;
+            header.size = (std::mem::size_of::<Header>() + message_body_size) as u32;
+        }
 
-        assert!(self.request_number > 0);
         self.request_number += 1;
 
-        log::debug!(
-            "{} request: user_data={} request={} size={} {:?}",
-            self.id,
-            user_data,
-            message.header.request,
-            message.header.size,
-            operation
-        );
-
-        if self.request_queue.full() {
+        if self.request_queue.is_full() {
             callback(
                 user_data,
                 operation,
@@ -176,271 +106,213 @@ where
             return;
         }
 
-        let was_empty = self.request_queue.empty();
-
+        let was_empty = self.request_queue.is_empty();
         self.request_queue.push_assume_capacity(Request {
             user_data,
             callback,
-            message: message.clone_ref(),
+            message,
         });
 
         if was_empty {
-            self.send_request_for_the_first_time(message);
+            let mut network_message = self.message_pool.get_message().unwrap();
+            network_message
+                .buffer
+                .copy_from_slice(&self.request_queue.front().unwrap().message.buffer);
+            self.send_request_for_the_first_time(network_message);
         }
     }
 
-    pub fn get_message(&mut self) -> &mut Message {
-        return self.message_bus.get_message();
+    pub fn tick(&mut self) {
+        self.ticks += 1;
+        self.ping_timeout.tick();
+        self.request_timeout.tick();
+
+        if self.ping_timeout.fired() {
+            self.on_ping_timeout();
+        }
+        if self.request_timeout.fired() {
+            self.on_request_timeout();
+        }
     }
 
-    pub fn unref(&mut self, message: &Message) {
-        self.message_bus.unref(message);
+    pub fn on_message(&mut self, message: PooledMessage) {
+        if message.header().invalid().is_some() {
+            return;
+        }
+        if message.header().cluster != self.cluster {
+            return;
+        }
+
+        match message.header().command {
+            Command::Pong => self.on_pong(&message),
+            Command::Reply => self.on_reply(message),
+            Command::Eviction => self.on_eviction(&message),
+            _ => {}
+        }
     }
 
     fn on_eviction(&mut self, eviction: &Message) {
-        assert!(eviction.header.command == eviction);
-        assert!(eviction.header.cluster == self.cluster);
-
-        if eviction.header.client != self.id {
-            log::warn!(
-                "{}: on_eviction: ignoring (wrong client={})",
-                self.id,
-                eviction.header.client
-            );
+        if eviction.header().client != self.id {
             return;
         }
-
-        if eviction.header.view < self.view {
-            log::debug!(
-                "{}: on_eviction: ignoring (older view = {})",
-                self.id,
-                eviction.header.view
-            );
+        if eviction.header().view < self.view {
             return;
         }
-
-        assert!(eviction.header.client == self.id);
-        assert!(eviction.header.view >= self.view);
-
-        log::error!(
-            "{}: session evicted: too many concurrent client sessions",
+        panic!(
+            "Session evicted: client ID {} was evicted by the cluster.",
             self.id
         );
     }
 
-    fn on_pong(&mut self, pong: &mut Message) {
-        assert!(pong.header.command == pong);
-        assert!(pong.header.cluster == self.cluster);
-
-        if pong.header != 0 {
-            log::debug!("{}: on_pong: ignoring (client != 0)", self.id);
+    fn on_pong(&mut self, pong: &Message) {
+        if pong.header().client != 0 {
             return;
         }
-
-        if pong.header.view > self.view {
-            log::debug!(
-                "{}: on_pong: newer view={}..{}",
-                self.id,
-                self.view,
-                pong.header.view
-            );
-            self.view = pong.header.view;
+        if pong.header().view > self.view {
+            self.view = pong.header().view;
         }
-
-        self.register()
+        self.register_if_needed();
     }
 
-    fn on_reply(&mut self, reply: &mut Message) {
-        assert!(reply.header.valid_checksum());
-        assert!(reply.header.valid_checksum_body(reply.body()));
+    fn on_reply(&mut self, reply_message: PooledMessage) {
+        let reply_header = *reply_message.header();
 
-        if reply.header.client != self.id {
-            log::debug!(
-                "{}: on_reply: ignoring (wrong client = {})",
-                self.id,
-                reply.header.client
-            );
+        if reply_header.client != self.id {
             return;
         }
 
-        if let Some(inflight) = self.request_queue.head_ptr() {
-            if reply.header.request < inflight.messsage.header.request {
-                log::debug!(
-                    "{}: on_reply: ignoring (wrong client={}",
-                    self.id,
-                    self.header.client
-                );
-                return;
-            }
-        } else {
-            log::debug!("{}: on_reply: ignoring (on inflight request)", self.id);
+        let inflight_request_number = match self.request_queue.front() {
+            Some(req) => req.message.header().request,
+            None => return,
+        };
+
+        if reply_header.request < inflight_request_number {
             return;
         }
 
         let inflight = self.request_queue.pop().unwrap();
 
-        log::debug!(
-            "{}: on_reply: user_data={} request={} size={}",
-            self.id,
-            inflight.user_data,
-            reply.header.request,
-            reply.header.size,
-        );
+        assert!(reply_header.is_checksum_valid());
+        assert!(reply_header.is_checksum_body_valid(reply_message.body()));
+        assert!(reply_header.parent == self.parent);
+        assert!(reply_header.request == inflight.message.header().request);
+        assert!(reply_header.operation == inflight.message.header().operation);
 
-        assert!(reply.header.parent == self.parent);
-        assert!(reply.header.client == self.id);
-        assert!(reply.header.context == 0);
-        assert!(reply.header.request == inflight.message.header.request);
-        assert!(reply.header.cluster == self.cluster);
-        assert!(reply.header.op == reply.header.commit);
-        assert!(reply.header.operation == inflight.message.header.operation);
-
-        self.parent = reply.header.checksum;
-
-        if reply.header.view > self.view {
-            log::debug!(
-                "{}: on_reply: newer view={}..{}",
-                self.id,
-                self.view,
-                reply.header.view
-            );
-            self.view = reply.header.view;
+        self.parent = reply_header.checksum;
+        if reply_header.view > self.view {
+            self.view = reply_header.view;
         }
 
         self.request_timeout.stop();
 
-        if inflight.message.header.operation == Operation::Register {
+        if inflight.message.header().operation == Operation::Register {
             assert!(self.session == 0);
-            assert!(reply.header.commit > 0);
-            self.session = reply.header.commit;
+            assert!(reply_header.commit > 0);
+            self.session = reply_header.commit;
+        }
+
+        if let Some(next_request) = self.request_queue.front() {
+            let mut network_message = self.message_pool.get_message().unwrap();
+            network_message
+                .buffer
+                .copy_from_slice(&next_request.message.buffer);
+            self.send_request_for_the_first_time(network_message);
+        }
+
+        if inflight.message.header().operation != Operation::Register {
+            (inflight.callback)(
+                inflight.user_data,
+                inflight.message.header().operation,
+                Ok(reply_message.body()),
+            );
         }
     }
 
     fn on_ping_timeout(&mut self) {
         self.ping_timeout.reset();
+        let mut message = self.message_pool.get_message().expect("Pool exhausted");
+        let header = message.header_mut();
+        header.command = Command::Ping;
+        header.cluster = self.cluster;
+        header.client = self.id;
+        header.set_checksums(&[]);
 
-        let ping = Header {
-            command: self.ping,
-            cluster: self.cluster,
-            client: self.id,
-            ..Default::default()
-        };
-
-        self.send_header_to_replicas(ping);
+        for i in 0..self.replica_count {
+            let mut network_message = self.message_pool.get_message().expect("Pool exhausted");
+            network_message.buffer.copy_from_slice(&message.buffer);
+            self.message_bus.send_message_to_replica(i, network_message);
+        }
     }
 
     fn on_request_timeout(&mut self) {
-        self.request_timeout.backoff(self.prng.random());
+        self.request_timeout.backoff(&mut self.prng);
 
-        let message = self.request_queue.head_ptr().message;
-        assert!(message.header.command == request);
-        assert!(message.header.request <= self.request_number);
-        assert!(message.header.checksum == self.parent);
-        assert!(message.header.context == self.session);
+        if let Some(inflight) = self.request_queue.front() {
+            let replica_index =
+                (self.view as u8 + self.request_timeout.attempts) % self.replica_count;
 
-        log::debug!(
-            "{}: on_request_timeout: resending request={} checksum={}",
-            self.id,
-            message.header.request,
-            message.header.checksum
-        );
+            let mut network_message = self.message_pool.get_message().expect("Pool exhausted");
+            network_message
+                .buffer
+                .copy_from_slice(&inflight.message.buffer);
 
-        self.send_message_to_replica(
-            self.view + self.request_timeout.attempt % self.replica_count,
-            message,
-        );
+            network_message.update_checksums();
+
+            self.message_bus
+                .send_message_to_replica(replica_index, network_message);
+        }
     }
 
-    fn create_mesage_from_header(&mut self, header: Header) -> &mut Message {
-        assert!(header.client == self.id);
-        assert!(header.cluster == self.cluster);
-        assert!(header.size == mem::size_of::<Header>);
+    fn send_request_for_the_first_time(&mut self, mut network_message: PooledMessage) {
+        {
+            let header = network_message.header_mut();
+            header.parent = self.parent;
+            header.context = self.session as u128;
+            header.view = self.view;
+        }
+        network_message.update_checksums();
 
-        let message = self.message_bus.pool.get_message();
+        self.parent = network_message.header().checksum;
+        self.request_timeout.start();
 
-        message.header = header;
-        message.header.set_checksum_body(message.body());
-        message.header.set_checksume();
-
-        return message;
+        let leader_index = (self.view % self.replica_count as u32) as u8;
+        self.message_bus
+            .send_message_to_replica(leader_index, network_message);
     }
 
-    fn register(&mut self) {
+    fn register_if_needed(&mut self) {
         if self.request_number > 0 {
             return;
         }
 
-        let message = self.message_bus.get_message();
+        let mut message = self.message_pool.get_message().expect("Pool exhausted");
 
-        message.header = {
-            self.client  = self.id;
-            self.request = self.request_number;
-            self.cluster = self.cluster;
-            self.command = request;
-            self.operation = register;
-        };
+        {
+            let header = message.header_mut();
+            header.client = self.id;
+            header.request = self.request_number; // Will be 0
+            header.cluster = self.cluster;
+            header.command = Command::Request;
+            header.operation = Operation::Register;
+            header.size = std::mem::size_of::<Header>() as u32;
+        }
 
-        assert!(self.request_number == 0);
         self.request_number += 1;
+        assert!(self.request_queue.is_empty());
+        let was_empty = self.request_queue.is_empty();
 
-        log::debug!("{}: register: registering a session with the cluster", self.id);
+        self.request_queue.push_assume_capacity(Request {
+            user_data: 0,
+            callback: Box::new(|_, _, _| {}),
+            message,
+        });
 
-        assert!(self.request_queue.empty());
-
-        self.request_queue.push_assume_capacity() {
-            user_data = 0,
-            callback = undefined,
-            message = message.as_ref(),
-        }
-
-        self.send_request_for_the_first_time(message);
-    }
-
-    fn send_header_to_replica(&mut self, replica: u8, header: Header) {
-        let message = self.create_message_from_header(header);
-        self.send_message_to_replica(replica, message);
-    }
-
-    fn send_header_to_replicas(&mut self, header: Header) {
-        let message = self.create_message_from_header(header);
-
-        let mut replica: u8 = 0;
-        while replica < self.replica_count {
-            replica += 1;
-            self.send_message_to_replica(replica, message);
+        if was_empty {
+            let mut network_message = self.message_pool.get_message().unwrap();
+            network_message
+                .buffer
+                .copy_from_slice(&self.request_queue.front().unwrap().message.buffer);
+            self.send_request_for_the_first_time(network_message);
         }
     }
-
-    fn send_message_to_replica(&mut self, replica: u8, message: &Message) {
-        log::debug!("{}: sending {:?} to replica {}: {}", self.id, message.header.command, replica, message.header);
-
-        assert!(replica < self.replica_count);
-        assert!(message.header.valid_checksum());
-        assert!(message.header.client == self.id);
-        assert!(message.header.cluster == self.cluster);
-
-        self.message_bus.send_message_to_replica(replica, message);
-    }
-
-
-    fn send_request_for_the_first_time(&mut self, message: &Message) {
-        assert!(self.request_queue.head_ptr().message == message);
-
-        message.header.parent = self.parent;
-        message.header.context = self.session;
-
-        message.header.view = self.view;
-        message.header.set_checksum_body(message.body());
-        message.header.set_checksum();
-
-        self.parent = message.header.checksum;
-
-        log::debug!("{}: send_request_for_the_first_time: request={} checksum={}", self.id, message.header.request, message.header.checksum);
-
-        assert!(!self.request_timeout.ticking);
-        self.request_timeout.start();
-
-        self.send_message_to_replica(self.view % self.replica_count, message);
-    }
-
 }

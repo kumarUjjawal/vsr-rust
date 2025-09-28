@@ -58,10 +58,10 @@ impl SimulatedStorage {
     fn x_in_100(&self, x: u8) -> bool {
         assert!(x <= 100);
         if x == 0 {
-            return None;
+            return None::<T>.is_some();
         }
 
-        self.prng.lock().unwrap().gen_range(0..100) < x
+        self.prng.lock().unwrap().random_range(0..100) < x
     }
 
     fn faulty_sectors_range(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
@@ -98,9 +98,9 @@ impl Storage for SimulatedStorage {
     async fn read_sectors(&self, buffer: &mut [u8], offset: u64) -> Result<(), StorageError> {
         self.assert_bounds_and_alignment(buffer, offset);
 
-        self.simulate_latency(
+        self.simulated_latency(
             self.options.read_latency_min,
-            self.options.ready_latency.mean,
+            self.options.read_latency_mean,
         )
         .await;
 
@@ -120,7 +120,7 @@ impl Storage for SimulatedStorage {
     async fn write_sectors(&self, buffer: &[u8], offset: u64) -> Result<(), StorageError> {
         self.assert_bounds_and_alignment(buffer, offset);
 
-        self.simulate_latency(
+        self.simulated_latency(
             self.options.write_latency_min,
             self.options.write_latency_mean,
         )

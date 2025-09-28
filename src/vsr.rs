@@ -32,7 +32,7 @@ pub enum Command {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Reserved = 0,
     Init = 1,
@@ -90,7 +90,7 @@ impl Header {
     const HEADER_SIZE_CHECK: () = assert!(mem::size_of::<Header>() == 128);
 
     /// Calculate the checksum for the header itself
-    fn calculate_checksum(&self) -> u128 {
+    pub fn calculate_checksum(&self) -> u128 {
         let mut temp = *self;
         temp.checksum = 0;
         let bytes: &[u8] = unsafe {
@@ -101,7 +101,12 @@ impl Header {
         u128::from_le_bytes(hash)
     }
 
-    fn calculate_checksum_body(body: &[u8]) -> u128 {
+    pub fn set_checksums(&mut self, body: &[u8]) {
+        self.checksum_body = Self::calculate_checksum_body(body);
+        self.checksum = self.calculate_checksum();
+    }
+
+    pub fn calculate_checksum_body(body: &[u8]) -> u128 {
         let hash: [u8; 16] = blake3::hash(body).as_bytes()[..16].try_into().unwrap();
         u128::from_le_bytes(hash)
     }

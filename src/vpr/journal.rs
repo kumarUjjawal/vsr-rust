@@ -60,17 +60,15 @@ impl<S: Storage> Journal<S> {
         assert!(headers_count as usize >= headers_per_sector);
 
         let header_copies = 2;
-        let size_headers = (headers_count as usize) * std::mem::size_of::<Header>() as u64;
+        let size_headers = (headers_count as usize) * std::mem::size_of::<Header>();
         let size_headers_copies = size_headers * header_copies;
-        assert!(size_headers_copies < size);
-        let size_circular_buffer = size - size_headers_copies;
 
         let mut headers = vec![Header::default(); headers_count as usize];
         headers[0] = *init_prepare;
 
         Self {
             storage,
-            size_headers,
+            size_headers: size_headers.try_into().unwrap(),
             size_circular_buffer,
             headers,
             dirty: BitSet::new(headers_count as usize),
@@ -133,7 +131,7 @@ impl<S: Storage> Journal<S> {
 
             Ok(())
         } else {
-            Err(StorageError("Cannot ready dirty of faulty entry".inot()))
+            Err(StorageError("Cannot ready dirty of faulty entry".into()))
         }
     }
 
@@ -159,14 +157,14 @@ impl<S: Storage> Journal<S> {
         let headers_as_bytes = unsafe {
             std::slice::from_raw_parts(
                 self.headers.as_ptr() as *const u8,
-                self.header.len() * std::mem::size_of::<Header>(),
+                self.headers.len() * std::mem::size_of::<Header>(),
             )
         };
 
         temp_header_buffer.copy_from_slice(&headers_as_bytes[start..start + config::SECTOR_SIZE]);
 
-        self.header_version = (self.header_version + 1) & 2;
-        let version1 = self.header.version;
+        self.headers_version = (self.headers.version + 1) & 2;
+        let version1 = self.headers.version;
         self.headers_version = (self.headers_version + 1) % 2;
         let version2 = self.headers_version;
 

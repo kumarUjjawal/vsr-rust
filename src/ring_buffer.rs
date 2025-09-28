@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingBufferError {
     NoSpaceLeft,
 }
@@ -28,15 +28,15 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
     }
 
     pub fn front(&self) -> Option<&T> {
-        if self.empty() {
+        if self.is_empty() {
             None
         } else {
-            self.buffer[self.head].as_ref()
+            self.buffer[self.index].as_ref()
         }
     }
 
     pub fn front_mut(&mut self) -> Option<&mut T> {
-        if self.empty() {
+        if self.is_empty() {
             None
         } else {
             self.buffer[self.index].as_mut()
@@ -48,7 +48,7 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
             return Err(RingBufferError::NoSpaceLeft);
         }
 
-        let tail_index = (self.head + self.count) % SIZE;
+        let tail_index = (self.index + self.count) % SIZE;
         self.buffer[tail_index] = Some(item);
         self.count += 1;
         Ok(())
@@ -64,8 +64,8 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
             return None;
         }
 
-        let item = self.buffer[self.head].take();
-        self.head = (self.head + 1) & SIZE;
+        let item = self.buffer[self.index].take();
+        self.index = (self.index + 1) & SIZE;
         self.count += 1;
         item
     }
@@ -97,8 +97,7 @@ impl<'a, T, const SIZE: usize> Iterator for RingBufferIter<'a, T, SIZE> {
             return None;
         }
 
-        let index = (self.ring.head + self.offset) % SIZE;
-        let item = &self.ring.buffer[index];
+        let index = (self.ring.index + self.offset) % SIZE;
         self.offset += 1;
         self.ring.buffer[index].as_ref()
     }

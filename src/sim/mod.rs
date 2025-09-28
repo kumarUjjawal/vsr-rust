@@ -1,4 +1,4 @@
-mod message_bus;
+pub mod message_bus;
 mod network;
 mod state_machine;
 mod storage;

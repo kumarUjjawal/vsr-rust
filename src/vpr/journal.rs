@@ -63,6 +63,12 @@ impl<S: Storage> Journal<S> {
         let size_headers = (headers_count as usize) * std::mem::size_of::<Header>();
         let size_headers_copies = size_headers * header_copies;
 
+        let size_circular_buffer = size - size_headers_copies as u64;
+        assert!(
+            size_circular_buffer >= 64 * 1024 * 1024,
+            "Size is too small for circular buffer"
+        );
+
         let mut headers = vec![Header::default(); headers_count as usize];
         headers[0] = *init_prepare;
 
@@ -163,8 +169,8 @@ impl<S: Storage> Journal<S> {
 
         temp_header_buffer.copy_from_slice(&headers_as_bytes[start..start + config::SECTOR_SIZE]);
 
-        self.headers_version = (self.headers.version + 1) & 2;
-        let version1 = self.headers.version;
+        self.headers_version = (self.headers_version + 1) % 2;
+        let version1 = self.headers_version;
         self.headers_version = (self.headers_version + 1) % 2;
         let version2 = self.headers_version;
 

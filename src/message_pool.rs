@@ -63,14 +63,14 @@ impl Message {
         let header_size = std::mem::size_of::<Header>();
         let total_size = self.header().size as usize;
         let body_size = total_size.saturating_sub(header_size);
-        &self.buffer[header_size.header_size + body_size]
+        &self.buffer[header_size..header_size + body_size]
     }
 
     pub fn body_mut(&mut self) -> &mut [u8] {
         let header_size = std::mem::size_of::<Header>();
         let total_size = self.header().size as usize;
         let body_size = total_size.saturating_sub(header_size);
-        &mut self.buffer[header_size.header_size + body_size]
+        &mut self.buffer[header_size..header_size + body_size]
     }
 
     pub fn update_checksums(&mut self) {

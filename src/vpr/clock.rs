@@ -1,4 +1,5 @@
 use crate::config;
+use crate::vpr::marzullo::{Bound, Interval, Marzullo, Tuple};
 use log::{debug, error, info, warn};
 use std::cmp;
 use std::time::{Duration, Instant};
@@ -8,8 +9,6 @@ const CLOCK_OFFSET_TOLERANCE_MAX: Duration =
 const EPOCH_MAX: Duration = Duration::from_millis(config::CLOCK_EPOCH_MAX_MS);
 const WINDOW_MIN: Duration = Duration::from_millis(config::CLOCK_SYNCHRONIZATION_WINDOW_MIN_MS);
 const WINDOW_MAX: Duration = Duration::from_millis(config::CLOCK_SYNCHRONIZATION_WINDOW_MAX_MS);
-
-use crate::marzullo::{Bound, Interval, Marzullo, Tuple};
 
 pub trait Time {
     fn monotonic(&self) -> Instant;

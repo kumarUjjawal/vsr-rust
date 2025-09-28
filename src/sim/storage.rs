@@ -58,7 +58,7 @@ impl SimulatedStorage {
     fn x_in_100(&self, x: u8) -> bool {
         assert!(x <= 100);
         if x == 0 {
-            return None::<T>.is_some();
+            return None.is_some();
         }
 
         self.prng.lock().unwrap().random_range(0..100) < x

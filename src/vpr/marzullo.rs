@@ -110,7 +110,7 @@ fn less_than(a: &Tuple, b: &Tuple) -> bool {
         return false;
     }
 
-    return false;
+    false
 }
 
 fn insertion_sort(tuples: &mut [Tuple]) {

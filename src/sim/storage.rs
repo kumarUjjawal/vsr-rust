@@ -105,13 +105,13 @@ impl Storage for SimulatedStorage {
         let mut mem = self.memory.lock().unwrap();
         let len = buffer.len();
 
-        if let Some((fault_start, fault_end)) = self.faulty_sectors_range(offset, len as u64) {
-            if self.x_in_100(self.options.read_fault_probability) {
-                let relative_start = (fault_start - offset) as usize;
-                let relative_end = (fault_end - offset) as usize;
-                let faulty_slice = &mut mem[offset as usize..][relative_start..relative_end];
-                self.prng.lock().unwrap().fill_bytes(faulty_slice);
-            }
+        if let Some((fault_start, fault_end)) = self.faulty_sectors_range(offset, len as u64)
+            && self.x_in_100(self.options.read_fault_probability)
+        {
+            let relative_start = (fault_start - offset) as usize;
+            let relative_end = (fault_end - offset) as usize;
+            let faulty_slice = &mut mem[offset as usize..][relative_start..relative_end];
+            self.prng.lock().unwrap().fill_bytes(faulty_slice);
         }
 
         let disk_slice = &mem[offset as usize..offset as usize + len];
@@ -134,11 +134,11 @@ impl Storage for SimulatedStorage {
 
         mem[offset as usize..offset as usize + len].copy_from_slice(buffer);
 
-        if let Some((fault_start, fault_end)) = self.faulty_sectors_range(offset, len as u64) {
-            if self.x_in_100(self.options.write_fault_probability) {
-                let faulty_slice = &mut mem[fault_start as usize..fault_end as usize];
-                self.prng.lock().unwrap().fill_bytes(faulty_slice);
-            }
+        if let Some((fault_start, fault_end)) = self.faulty_sectors_range(offset, len as u64)
+            && self.x_in_100(self.options.write_fault_probability)
+        {
+            let faulty_slice = &mut mem[fault_start as usize..fault_end as usize];
+            self.prng.lock().unwrap().fill_bytes(faulty_slice);
         }
 
         Ok(())

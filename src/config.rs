@@ -24,7 +24,7 @@ pub const JOURNAL_SIZE_MAX: i32 = 128 * 1024 * 1024;
 
 pub const CONNECTION_MAX: usize = REPLICAS_MAX + CLIENTS_MAX;
 
-pub const MESSAGE_SIZE_MAX: usize = 1 * 1024 * 1024;
+pub const MESSAGE_SIZE_MAX: usize = 1024 * 1024;
 
 pub const PIPELINING_MAX: usize = CLIENTS_MAX;
 

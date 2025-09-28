@@ -24,7 +24,7 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
     }
 
     pub fn is_empty(&self) -> bool {
-        return self.count == 0;
+        self.count == 0
     }
 
     pub fn front(&self) -> Option<&T> {

@@ -303,10 +303,8 @@ impl Header {
                             if self.request != 0 {
                                 return Some("request != 0");
                             }
-                        } else {
-                            if self.request == 0 {
-                                return Some("request == 0");
-                            }
+                        } else if self.request == 0 {
+                            return Some("request == 0");
                         }
                     }
                 }
@@ -361,10 +359,8 @@ impl Header {
                             if self.request != 0 {
                                 return Some("request != 0");
                             }
-                        } else {
-                            if self.request == 0 {
-                                return Some("request == 0");
-                            }
+                        } else if self.request == 0 {
+                            return Some("request == 0");
                         }
                     }
                 }

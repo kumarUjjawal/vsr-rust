@@ -184,14 +184,12 @@ impl<P: Clone + Send + 'static> PacketSimulator<P> {
             {
                 self.unpartition_network();
             }
-        } else {
-            if self.options.replica_count > 1
-                && self
-                    .prng
-                    .random_ratio(self.options.partition_probability as u32, 100)
-            {
-                self.partition_network();
-            }
+        } else if self.options.replica_count > 1
+            && self
+                .prng
+                .random_ratio(self.options.partition_probability as u32, 100)
+        {
+            self.partition_network();
         }
     }
 

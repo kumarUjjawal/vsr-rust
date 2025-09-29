@@ -43,6 +43,10 @@ impl MessageBus for SimulatedMessageBus {
         let packet = Packet {
             buffer: message.buffer.to_vec(),
         };
+        println!(
+            "bus {:?} sending to replica {} (source {})",
+            self.process_id, replica_id, source_addr
+        );
         self.sender
             .send(NetworkCommand::Send { path, packet })
             .await
@@ -76,8 +80,8 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn new(replica_count: u8, client_count: u8, message_pool: MessagePool) -> Self {
-        let node_count = replica_count + client_count;
+    pub fn new(replica_count: u8, _client_count: u8, message_pool: MessagePool) -> Self {
+        let node_count = config::REPLICAS_MAX as u8 + config::CLIENTS_MAX as u8;
         let options = packet_simulator::Options {
             one_way_delay_mean: 10,
             one_way_delay_min: 1,

@@ -31,6 +31,7 @@ impl Cluster {
 
         let mut replicas = Vec::new();
         let mut replica_receivers = Vec::new();
+        let state_seed = rng.random();
         for i in 0..replica_count {
             let (bus, rx) = network.register_process(vsr::ProcessType::Replica(i));
             let storage = Arc::new(SimulatedStorage::new(
@@ -47,7 +48,7 @@ impl Cluster {
                 FaultyAreas { first_offset: 0, period: 0 },
             ));
             let time = DeterministicTime::new(rng.random());
-            let sm = HashingStateMachine::new(rng.random());
+            let sm = HashingStateMachine::new(state_seed);
             
             let replica = Replica::new(
                 Arc::new(bus), replica_pool.clone(), storage, time, sm,
@@ -89,7 +90,14 @@ impl Cluster {
         {
             loop {
                 match rx.try_recv() {
-                    Ok(msg) => replica.on_message(msg).await,
+                    Ok(msg) => {
+                        println!(
+                            "delivering {:?} to replica {}",
+                            msg.header().command,
+                            replica.replica_id()
+                        );
+                        replica.on_message(msg).await
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
                 }

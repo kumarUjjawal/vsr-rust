@@ -8,6 +8,7 @@ use crate::vsr::{Command, Header, Operation};
 use rand::prelude::*;
 use std::fmt::Debug;
 use std::sync::Arc;
+use tokio::spawn;
 
 pub type RequestCallback = Box<dyn FnOnce(u128, Operation, Result<&[u8], ClientError>) + Send>;
 
@@ -244,9 +245,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         for i in 0..self.replica_count {
             let mut network_message = self.message_pool.get_message().expect("Pool exhausted");
             network_message.buffer.copy_from_slice(&message.buffer);
-            let _ = self
-                .message_bus
-                .send_message_to_replica(i, network_message);
+            self.send_to_replica(i, network_message);
         }
     }
 
@@ -264,9 +263,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
 
             network_message.update_checksums();
 
-            let _ = self
-                .message_bus
-                .send_message_to_replica(replica_index, network_message);
+            self.send_to_replica(replica_index, network_message);
         }
     }
 
@@ -283,9 +280,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         self.request_timeout.start();
 
         let leader_index = (self.view % self.replica_count as u32) as u8;
-        let _ = self
-            .message_bus
-            .send_message_to_replica(leader_index, network_message);
+        self.send_to_replica(leader_index, network_message);
     }
 
     fn register_if_needed(&mut self) {
@@ -322,5 +317,12 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
                 .copy_from_slice(&self.request_queue.front().unwrap().message.buffer);
             self.send_request_for_the_first_time(network_message);
         }
+    }
+
+    fn send_to_replica(&self, replica_id: u8, message: PooledMessage) {
+        let bus = self.message_bus.clone();
+        spawn(async move {
+            bus.send_message_to_replica(replica_id, message).await;
+        });
     }
 }

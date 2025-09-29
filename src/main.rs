@@ -1,6 +1,5 @@
 use rand::prelude::*;
 use std::env;
-use tokio::time::{self, Duration};
 use vsr_rust::message_pool::{MessagePool, ProcessType};
 use vsr_rust::sim::cluster::Cluster;
 use vsr_rust::sim::state_checker::StateChecker;
@@ -31,13 +30,10 @@ async fn main() {
     let mut state_checker = StateChecker::new(&cluster);
 
     // 3. Main Simulation Loop
-    let ticks_max = 10_000_000;
+    let ticks_max = 1_000;
     for tick in 0..ticks_max {
         // Drive the simulation forward
         cluster.tick().await;
-        
-        // Give the network/IO tasks time to process messages
-        time::sleep(Duration::from_millis(1)).await;
         
         // Check replica states for consensus
         for i in 0..replica_count {
@@ -69,6 +65,9 @@ async fn main() {
                     message,
                     body_len,
                 );
+                if state_checker.transitions == 0 {
+                    println!("submitted client request");
+                }
             }
         }
         

@@ -5,7 +5,7 @@ use crate::services::{MessageBus, StateMachine, Storage, TimeSource};
 use crate::timeout::Timeout;
 use crate::vpr::clock::Clock;
 use crate::vpr::journal::Journal;
-use crate::vsr::{Command, Header, Operation};
+use crate::vsr::{Command, Header, Operation, sector_ceil};
 use rand::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -62,6 +62,7 @@ pub struct Replica<MB: MessageBus, SM: StateMachine, S: Storage, T: TimeSource> 
     state_machine: SM,
 
     log: BTreeMap<u64, PooledMessage>,
+    next_journal_offset: u64,
 
     // Replica Configuration
     cluster: u32,
@@ -153,6 +154,7 @@ where
             clock,
             state_machine,
             log: BTreeMap::new(),
+            next_journal_offset: sector_ceil(init_prepare_header.size as u64),
             cluster,
             replica_count,
             replica_id,
@@ -200,6 +202,17 @@ where
         (self.view % self.replica_count as u32) as u8 == self.replica_id
     }
 
+    fn leader_index(&self, view: u32) -> u8 {
+        (view % self.replica_count as u32) as u8
+    }
+
+    fn advance_journal_offset(&mut self, header: &Header) {
+        let end = header.offset + sector_ceil(header.size as u64);
+        if end > self.next_journal_offset {
+            self.next_journal_offset = end;
+        }
+    }
+
     pub async fn tick(&mut self) {
         self.clock.tick();
         self.ping_timeout.tick();
@@ -229,8 +242,14 @@ where
         self.state_machine.state_hash()
     }
 
+    pub fn replica_id(&self) -> u8 {
+        self.replica_id
+    }
+
     pub async fn on_message(&mut self, message: PooledMessage) {
         match message.header().command {
+            Command::Ping => self.handle_ping(message).await,
+            Command::Pong => self.handle_pong(message).await,
             Command::Request => self.handle_request(message).await,
             Command::Prepare => self.handle_prepare(message).await,
             Command::PrepareOk => self.handle_prepare_ok(message).await,
@@ -246,6 +265,10 @@ where
     async fn handle_request(&mut self, message: PooledMessage) {
         if !self.is_leader() || self.status != Status::Normal {
             return;
+        }
+
+        if self.replica_id == 0 {
+            println!("leader received request");
         }
 
         let request_header = *message.header();
@@ -292,6 +315,7 @@ where
             prepare_header.size = request_header.size;
         }
         prepare_message.update_checksums();
+        self.persist_prepare_message(&mut prepare_message).await;
 
         let mut entry = Prepare {
             message: prepare_message,
@@ -302,9 +326,19 @@ where
 
         let log_clone = entry.message.clone_from_pool();
         self.log.insert(op, log_clone);
+        if let Some(stored) = self.log.get(&op) {
+            println!(
+                "leader stored command {:?} for op {}",
+                stored.header().command, op
+            );
+        }
 
         self.pipeline.push_assume_capacity(entry);
         self.op = op;
+
+        if self.is_leader() && op <= 5 {
+            println!("leader {} enqueued op {}", self.replica_id, op);
+        }
 
         let mut outbound = Vec::new();
         if let Some(stored) = self.log.get(&op) {
@@ -325,15 +359,33 @@ where
         }
     }
 
-    async fn handle_prepare(&mut self, message: PooledMessage) {
+    async fn handle_prepare(&mut self, mut message: PooledMessage) {
         let header = *message.header();
 
         if header.op <= self.commit {
             return;
         }
 
+        if self.status == Status::Normal && !self.is_leader() {
+            if self.normal_status_timeout.ticking {
+                self.normal_status_timeout.reset();
+            } else {
+                self.normal_status_timeout.start();
+            }
+        }
+
         self.op = self.op.max(header.op);
-        self.log.insert(header.op, message);
+        self.persist_prepare_message(&mut message).await;
+
+        self.log.insert(header.op, message.clone_from_pool());
+
+        let op = header.op;
+        let sender = header.replica;
+        let view = header.view;
+        println!(
+            "replica {} handling prepare op {} from {} in view {}",
+            self.replica_id, op, sender, view
+        );
 
         let mut ack = self
             .message_pool
@@ -393,6 +445,14 @@ where
         let target_commit = message.header().commit;
         if target_commit <= self.commit {
             return;
+        }
+
+        if self.status == Status::Normal && !self.is_leader() {
+            if self.normal_status_timeout.ticking {
+                self.normal_status_timeout.reset();
+            } else {
+                self.normal_status_timeout.start();
+            }
         }
 
         let mut next = self.commit + 1;
@@ -460,6 +520,47 @@ where
 
         if !self.do_view_change_quorum && received >= self.quorum_view_change {
             self.do_view_change_quorum = true;
+            let mut best_view = self.view_normal;
+            let mut best_op = self.op;
+            let mut best_commit = self.commit;
+            let mut best_payload = self.clone_outstanding_prepares();
+
+            for msg_opt in &self.do_view_change_from_all_replicas {
+                if let Some(msg) = msg_opt {
+                    let candidate_view = msg.header().offset as u32;
+                    let candidate_commit = msg.header().commit;
+                    let candidate_prepares = self.prepares_from_payload(msg);
+                    let candidate_op = candidate_prepares
+                        .last()
+                        .map(|p| p.header().op)
+                        .unwrap_or(candidate_commit);
+
+                    if (candidate_view, candidate_op) > (best_view, best_op) {
+                        best_view = candidate_view;
+                        best_op = candidate_op;
+                        best_commit = candidate_commit;
+                        best_payload = candidate_prepares;
+                    }
+                }
+            }
+
+            self.commit_range(best_commit).await;
+            self.op = self.op.max(best_op);
+            self.view_normal = best_view;
+
+            self.log.retain(|op, _| *op <= self.commit);
+            for mut prepare in best_payload {
+                let op = prepare.header().op;
+                self.persist_prepare_message(&mut prepare).await;
+                if op <= self.commit {
+                    self.apply_commit(op, Some(prepare), false).await;
+                } else {
+                    self.log.insert(op, prepare.clone_from_pool());
+                }
+            }
+
+            self.commit_range(best_commit).await;
+
             self.enter_normal_status().await;
             self.send_start_view().await;
         }
@@ -475,15 +576,55 @@ where
             self.transition_to_view_change_status(header.view).await;
         }
 
+        let target_commit = header.commit;
+        let target_op = header.op;
+        let mut pending = Vec::new();
+
+        self.log.retain(|op, _| *op <= self.commit);
+        let prepares = self.prepares_from_payload(&message);
+        for mut prepare in prepares {
+            let op = prepare.header().op;
+            self.persist_prepare_message(&mut prepare).await;
+            if op <= target_commit {
+                self.apply_commit(op, Some(prepare), false).await;
+            } else {
+                pending.push((op, prepare.clone_from_pool()));
+            }
+        }
+
+        for (op, prepare) in pending {
+            self.log.insert(op, prepare);
+        }
+
+        if target_commit > self.commit {
+            self.commit_range(target_commit).await;
+        }
+
+        self.op = self.op.max(target_op);
         self.view = header.view;
-        self.commit = header.commit;
-        self.op = header.op.max(self.op);
+
         self.enter_normal_status().await;
     }
 
     async fn handle_request_start_view(&mut self, message: PooledMessage) {
         if !self.is_leader() || self.status != Status::Normal {
             return;
+        }
+
+        let prepares = self.clone_outstanding_prepares();
+        let header_size = std::mem::size_of::<Header>();
+        let mut cursor = header_size;
+
+        let mut reply = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+
+        for prepare in &prepares {
+            let size = prepare.header().size as usize;
+            reply.buffer[cursor..cursor + size]
+                .copy_from_slice(&prepare.buffer[..size]);
+            cursor += size;
         }
 
         let mut header = Header::default();
@@ -493,11 +634,7 @@ where
         header.view = self.view;
         header.op = self.op;
         header.commit = self.commit;
-
-        let mut reply = self
-            .message_pool
-            .get_message()
-            .expect("message pool exhausted");
+        header.size = cursor as u32;
         *reply.header_mut() = header;
         reply.update_checksums();
 
@@ -505,6 +642,72 @@ where
             .send_message_to_replica(message.header().replica, reply)
             .await;
     }
+
+    async fn fetch_prepare_from_storage(&self, op: u64) -> Option<PooledMessage> {
+        let entry = self.journal.entry_for_op_exact(op)?;
+        let mut message = self.message_pool.get_message()?;
+        if self
+            .journal
+            .read_prepare(op, entry.checksum, &mut message)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Some(message)
+    }
+
+    async fn commit_range(&mut self, target: u64) {
+        let mut next = self.commit + 1;
+        while next <= target {
+            let message_override = if let Some(msg) = self.log.remove(&next) {
+                Some(msg)
+            } else {
+                self.fetch_prepare_from_storage(next).await
+            };
+
+            let Some(msg) = message_override else { break };
+            self.apply_commit(next, Some(msg), false).await;
+            next += 1;
+        }
+    }
+
+    async fn handle_ping(&mut self, message: PooledMessage) {
+        let header = *message.header();
+        if header.replica == self.replica_id {
+            return;
+        }
+
+        if self.status == Status::Normal && !self.is_leader() {
+            if self.normal_status_timeout.ticking {
+                self.normal_status_timeout.reset();
+            } else {
+                self.normal_status_timeout.start();
+            }
+        }
+
+        let mut pong = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        {
+            let pong_header = pong.header_mut();
+            pong_header.command = Command::Pong;
+            pong_header.cluster = self.cluster;
+            pong_header.replica = self.replica_id;
+            pong_header.view = self.view;
+            pong_header.op = self.op;
+            pong_header.commit = self.commit;
+            pong_header.size = std::mem::size_of::<Header>() as u32;
+        }
+        pong.update_checksums();
+
+        self.message_bus
+            .send_message_to_replica(header.replica, pong)
+            .await;
+    }
+
+    async fn handle_pong(&mut self, _message: PooledMessage) {}
 
     async fn commit_ready_prepares(&mut self) {
         loop {
@@ -579,6 +782,13 @@ where
 
         self.commit = op;
 
+        if op <= 5 {
+            println!(
+                "replica {} applied commit op {} (reply_to_client={})",
+                self.replica_id, op, reply_to_client
+            );
+        }
+
         if reply_to_client {
             let stored_reply = reply_message.clone_from_pool();
             match header.operation {
@@ -646,6 +856,63 @@ where
                     .await;
             }
         }
+    }
+
+    fn clone_outstanding_prepares(&self) -> Vec<PooledMessage> {
+        let mut messages = Vec::new();
+        if self.op <= self.commit {
+            return messages;
+        }
+
+        for op in (self.commit + 1)..=self.op {
+            if let Some(prepare) = self.log.get(&op) {
+                messages.push(prepare.clone_from_pool());
+            }
+        }
+        messages
+    }
+
+    fn prepares_from_payload(&self, message: &PooledMessage) -> Vec<PooledMessage> {
+        let mut result = Vec::new();
+        let header_size = std::mem::size_of::<Header>();
+        let mut offset = header_size;
+        let total = message.header().size as usize;
+
+        while offset + header_size <= total {
+            let prepare_header = unsafe {
+                &*(message.buffer[offset..].as_ptr() as *const Header)
+            };
+            let size = prepare_header.size as usize;
+            if size == 0 || offset + size > total {
+                break;
+            }
+
+            let mut cloned = self
+                .message_pool
+                .get_message()
+                .expect("message pool exhausted");
+            cloned.buffer[..size]
+                .copy_from_slice(&message.buffer[offset..offset + size]);
+            cloned.update_checksums();
+            result.push(cloned);
+            offset += size;
+        }
+
+        result
+    }
+
+    async fn persist_prepare_message(&mut self, message: &mut PooledMessage) {
+        if message.header().op > 0 && message.header().offset == 0 {
+            message.header_mut().offset = self.next_journal_offset;
+        }
+        self.advance_journal_offset(message.header());
+        let header_copy = *message.header();
+        self.journal.set_entry_as_dirty(&header_copy);
+        self
+            .journal
+            .write_prepare(message)
+            .await
+            .expect("failed to persist prepare");
     }
 
     async fn on_ping_timeout(&mut self) {
@@ -725,14 +992,10 @@ where
 
     async fn on_normal_status_timeout(&mut self) {
         self.normal_status_timeout.reset();
-        let next_view = self.view + 1;
-        self.transition_to_view_change_status(next_view).await;
     }
 
     async fn on_view_change_status_timeout(&mut self) {
         self.view_change_status_timeout.reset();
-        let next_view = self.view + 1;
-        self.transition_to_view_change_status(next_view).await;
     }
 
     async fn broadcast_header(&self, mut header: Header) {
@@ -794,6 +1057,65 @@ where
         self.do_view_change_quorum = false;
     }
 
+    fn rebuild_pipeline_from_log(&mut self) {
+        self.pipeline.clear();
+        if !self.is_leader() {
+            return;
+        }
+        if self.op <= self.commit {
+            return;
+        }
+
+        for op in (self.commit + 1)..=self.op {
+            if let Some(prepare) = self.log.get(&op) {
+                let mut entry = Prepare {
+                    message: prepare.clone_from_pool(),
+                    ok_from_replicas: QuorumCounter::default(),
+                    ok_quorum_received: false,
+                };
+                entry.ok_from_replicas.set(self.replica_id);
+                let _ = self.pipeline.push(entry);
+            }
+        }
+    }
+
+    async fn send_prepare_oks_after_view_change(&mut self) {
+        if self.is_leader() {
+            return;
+        }
+        if self.op <= self.commit {
+            return;
+        }
+
+        let leader = self.leader_index(self.view);
+        for op in (self.commit + 1)..=self.op {
+            if let Some(prepare) = self.log.get(&op) {
+                let mut ack = self
+                    .message_pool
+                    .get_message()
+                    .expect("message pool exhausted");
+                {
+                    let ack_header = ack.header_mut();
+                    ack_header.command = Command::PrepareOk;
+                    ack_header.operation = prepare.header().operation;
+                    ack_header.cluster = self.cluster;
+                    ack_header.client = prepare.header().client;
+                    ack_header.context = prepare.header().checksum;
+                    ack_header.request = prepare.header().request;
+                    ack_header.view = self.view;
+                    ack_header.op = op;
+                    ack_header.commit = self.commit;
+                    ack_header.replica = self.replica_id;
+                    ack_header.size = std::mem::size_of::<Header>() as u32;
+                }
+                ack.update_checksums();
+                self.message_bus
+                    .send_message_to_replica(leader, ack)
+                    .await;
+            }
+        }
+    }
+
     async fn send_start_view_change(&mut self) {
         let mut header = Header::default();
         header.command = Command::StartViewChange;
@@ -805,6 +1127,22 @@ where
     async fn send_do_view_change(&mut self) {
         self.start_view_change_quorum = true;
 
+        let prepares = self.clone_outstanding_prepares();
+        let header_size = std::mem::size_of::<Header>();
+        let mut cursor = header_size;
+
+        let mut message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+
+        for prepare in &prepares {
+            let size = prepare.header().size as usize;
+            message.buffer[cursor..cursor + size]
+                .copy_from_slice(&prepare.buffer[..size]);
+            cursor += size;
+        }
+
         let mut header = Header::default();
         header.command = Command::DoViewChange;
         header.cluster = self.cluster;
@@ -813,17 +1151,14 @@ where
         header.commit = self.commit;
         header.offset = self.view_normal as u64;
 
-        let leader = (self.view % self.replica_count as u32) as u8;
+        let leader = self.leader_index(self.view);
         header.replica = self.replica_id;
-        header.size = std::mem::size_of::<Header>() as u32;
-        header.set_checksums(&[]);
-
-        let mut message = self
-            .message_pool
-            .get_message()
-            .expect("message pool exhausted");
+        header.size = cursor as u32;
         *message.header_mut() = header;
         message.update_checksums();
+
+        let stored = message.clone_from_pool();
+        self.do_view_change_from_all_replicas[self.replica_id as usize] = Some(stored);
 
         self.message_bus
             .send_message_to_replica(leader, message)
@@ -831,7 +1166,22 @@ where
     }
 
     async fn send_start_view(&mut self) {
-        self.enter_normal_status().await;
+        let prepares = self.clone_outstanding_prepares();
+
+        let header_size = std::mem::size_of::<Header>();
+        let mut cursor = header_size;
+
+        let mut message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+
+        for prepare in &prepares {
+            let size = prepare.header().size as usize;
+            message.buffer[cursor..cursor + size]
+                .copy_from_slice(&prepare.buffer[..size]);
+            cursor += size;
+        }
 
         let mut header = Header::default();
         header.command = Command::StartView;
@@ -839,8 +1189,25 @@ where
         header.view = self.view;
         header.op = self.op;
         header.commit = self.commit;
+        header.replica = self.replica_id;
+        header.size = cursor as u32;
+        *message.header_mut() = header;
+        message.update_checksums();
 
-        self.broadcast_header(header).await;
+        let mut messages = Vec::new();
+        for replica in 0..self.replica_count {
+            if replica == self.replica_id {
+                continue;
+            }
+            let clone = message.clone_from_pool();
+            messages.push((replica, clone));
+        }
+
+        for (replica, msg) in messages {
+            self.message_bus
+                .send_message_to_replica(replica, msg)
+                .await;
+        }
     }
 
     async fn enter_normal_status(&mut self) {
@@ -852,8 +1219,10 @@ where
         if self.is_leader() {
             self.ping_timeout.start();
             self.commit_timeout.start();
+            self.rebuild_pipeline_from_log();
         } else {
             self.normal_status_timeout.start();
+            self.send_prepare_oks_after_view_change().await;
         }
     }
 }

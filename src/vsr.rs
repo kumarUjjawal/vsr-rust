@@ -87,7 +87,7 @@ impl Default for Header {
 }
 
 impl Header {
-    const HEADER_SIZE_CHECK: () = assert!(mem::size_of::<Header>() == 128);
+    const _HEADER_SIZE_CHECK: () = assert!(mem::size_of::<Header>() == 128);
 
     /// Calculate the checksum for the header itself
     pub fn calculate_checksum(&self) -> u128 {

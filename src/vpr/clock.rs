@@ -1,562 +1,209 @@
 use crate::config;
-use crate::vpr::marzullo::{Bound, Interval, Marzullo, Tuple};
-use log::{debug, error, info, warn};
-use std::cmp;
-use std::time::{Duration, Instant};
+use crate::services::TimeSource;
+use crate::vpr::marzullo::{self, Marzullo};
 
-const CLOCK_OFFSET_TOLERANCE_MAX: Duration =
-    Duration::from_millis(config::CLOCK_OFFSET_TOLERANCE_MAX_MS);
-const EPOCH_MAX: Duration = Duration::from_millis(config::CLOCK_EPOCH_MAX_MS);
-const WINDOW_MIN: Duration = Duration::from_millis(config::CLOCK_SYNCHRONIZATION_WINDOW_MIN_MS);
-const WINDOW_MAX: Duration = Duration::from_millis(config::CLOCK_SYNCHRONIZATION_WINDOW_MAX_MS);
-
-pub trait Time {
-    fn monotonic(&self) -> Instant;
-    fn realtime(&self) -> i64;
-    fn tick(&mut self);
-}
+const NS_PER_MS: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
 struct Sample {
-    /// The relative difference between our wall clock reading and that of the remote clock source.
+    /// The relative difference between our wall clock and a remote clock.
     clock_offset: i64,
-    one_way_delay: Duration,
+    one_way_delay: u64,
 }
 
-#[derive(Debug)]
 struct Epoch {
-    /// The best clock offset sample per remote clock source (with minimum one way delay) collected
-    /// over the course of a window period of several seconds.
+    /// The best clock offset sample per remote clock source.
     sources: Vec<Option<Sample>>,
-
-    /// The total number of samples learned while synchronizing this epoch.
-    samples: usize,
-
-    /// The monotonic clock timestamp when this epoch began. We use this to measure elapsed time.
-    monotonic: Instant,
-
-    /// The wall clock timestamp when this epoch began. We add the elapsed monotonic time to this
-    /// plus the synchronized clock offset to arrive at a synchronized realtime timestamp. We
-    /// capture this realtime when starting the epoch, before we take any samples, to guard against
-    /// any jumps in the system's realtime clock from impacting our measurements.
-    realtime: i64,
-
-    /// Once we have enough source clock offset samples in agreement, the epoch is synchronized.
-    /// We then have lower and upper bounds on the true cluster time, and can install this epoch for
-    /// subsequent clock readings. This epoch is then valid for several seconds, while clock drift
-    /// has not had enough time to accumulate into any significant clock skew, and while we collect
-    /// samples for the next epoch to refresh and replace this one.
-    synchronized: Option<Interval>,
-
-    /// A guard to prevent synchronizing too often without having learned any new samples.
-    learned: bool,
+    /// Monotonic timestamp when this epoch began.
+    monotonic_start: u64,
+    /// Wall clock timestamp when this epoch began.
+    realtime_start: i64,
+    /// Once synchronized, contains the lower and upper bounds of the true cluster time.
+    synchronized: Option<marzullo::Interval>,
 }
 
 impl Epoch {
-    fn new(replica_count: u8) -> Self {
+    fn new(replica_count: u8, time_source: &mut impl TimeSource, self_replica_id: u8) -> Self {
+        let mut sources = vec![None; replica_count as usize];
+        // A replica always has zero offset and delay to itself.
+        sources[self_replica_id as usize] = Some(Sample {
+            clock_offset: 0,
+            one_way_delay: 0,
+        });
+
         Self {
-            sources: vec![None; replica_count as usize],
-            samples: 0,
-            monotonic: Instant::now(),
-            realtime: 0,
+            sources,
+            monotonic_start: time_source.monotonic(),
+            realtime_start: time_source.realtime(),
             synchronized: None,
-            learned: false,
         }
     }
 
-    fn elapsed<T: Time>(&self, clock: &Clock<T>) -> Duration {
-        clock.time.monotonic().duration_since(self.monotonic)
-    }
-
-    fn reset(&mut self, replica: u8, monotonic: Instant, realtime: i64) {
-        self.sources.fill(None);
-        // A replica always has zero clock offset and network delay to its own system time reading:
-        self.sources[replica as usize] = Some(Sample {
-            clock_offset: 0,
-            one_way_delay: Duration::ZERO,
-        });
-        self.samples = 1;
-        self.monotonic = monotonic;
-        self.realtime = realtime;
-        self.synchronized = None;
-        self.learned = false;
-    }
-
-    fn sources_sampled(&self) -> usize {
-        self.sources.iter().filter(|s| s.is_some()).count()
+    fn elapsed_ns(&self, time_source: &impl TimeSource) -> u64 {
+        time_source.monotonic().saturating_sub(self.monotonic_start)
     }
 }
 
-pub struct Clock<T: Time> {
-    /// The index of the replica using this clock to provide synchronized time.
-    replica: u8,
-
-    /// The underlying time source for this clock (system time or deterministic time).
-    time: T,
-
-    /// An epoch from which the clock can read synchronized clock timestamps within safe bounds.
-    /// At least `config.clock_synchronization_window_min_ms` is needed for this to be ready to use.
+/// A distributed, fault-tolerant clock that provides synchronized time.
+pub struct Clock<T: TimeSource> {
+    time_source: T,
+    replica_id: u8,
+    /// The currently active epoch, used for providing synchronized time.
     epoch: Epoch,
-
-    /// The next epoch (collecting samples and being synchronized) to replace the current epoch.
+    /// The next epoch, which is currently collecting samples.
     window: Epoch,
-
-    /// A static allocation to convert window samples into tuple bounds for Marzullo's algorithm.
-    marzullo_tuples: Vec<Tuple>,
-
-    /// A kill switch to revert to unsynchronized realtime.
+    /// Pre-allocated buffer for Marzullo's algorithm tuples.
+    marzullo_tuples: Vec<marzullo::Tuple>,
     synchronization_disabled: bool,
 }
 
-impl<T: Time> Clock<T> {
-    pub fn new(replica_count: u8, replica: u8, time: T) -> Self {
-        assert!(replica_count > 0);
-        assert!(replica < replica_count);
+impl<T: TimeSource> Clock<T> {
+    pub fn new(mut time_source: T, replica_count: u8, replica_id: u8) -> Self {
+        let epoch = Epoch::new(replica_count, &mut time_source, replica_id);
+        let window = Epoch::new(replica_count, &mut time_source, replica_id);
 
-        // There are two Marzullo tuple bounds (lower and upper) per source clock offset sample:
-        let marzullo_tuples = Vec::with_capacity(replica_count as usize * 2);
-
-        let mut clock = Self {
-            replica,
-            time,
-            epoch: Epoch::new(replica_count),
-            window: Epoch::new(replica_count),
-            marzullo_tuples,
-            synchronization_disabled: replica_count == 1, // A cluster of one cannot synchronize.
+        let mut new_self = Self {
+            time_source,
+            replica_id,
+            epoch,
+            window,
+            marzullo_tuples: vec![
+                marzullo::Tuple {
+                    offset: 0,
+                    bound: marzullo::Bound::Lower
+                };
+                replica_count as usize * 2
+            ],
+            synchronization_disabled: replica_count <= 1,
         };
 
-        // Reset the current epoch to be unsynchronized,
-        clock.reset_epoch();
-        // and open a new epoch window to start collecting samples...
-        clock.reset_window();
-
-        clock
+        new_self.epoch.synchronized = None;
+        new_self
     }
-
-    /// Called by `Replica.on_pong()` with:
-    /// * the index of the `replica` that has replied to our ping with a pong,
-    /// * our monotonic timestamp `m0` embedded in the ping we sent, carried over into this pong,
-    /// * the remote replica's `realtime()` timestamp `t1`, and
-    /// * our monotonic timestamp `m2` as captured by our `Replica.on_pong()` handler.
-    pub fn learn(&mut self, replica: u8, m0: Instant, t1: i64, m2: Instant) {
-        if self.synchronization_disabled {
+    /// Learns from a remote clock sample (m0, t1, m2).
+    pub fn learn(&mut self, remote_replica_id: u8, m0: u64, t1: i64, m2: u64) {
+        if self.synchronization_disabled || remote_replica_id == self.replica_id {
             return;
         }
 
-        // A network routing fault must have replayed one of our outbound messages back against us:
-        if replica == self.replica {
-            warn!("{}: learn: replica == self.replica", self.replica);
-            return;
-        }
-
-        // Our m0 and m2 readings should always be monotonically increasing if not equal.
-        // Crucially, it is possible for a very fast network to have m0 == m2, especially where
-        // `config.tick_ms` is at a more course granularity. We must therefore tolerate RTT=0 or
-        // otherwise we would have a liveness bug simply because we would be throwing away
-        // perfectly good clock samples.
-        // This condition should never be true. Reject this as a bad sample:
         if m0 > m2 {
-            warn!("{}: learn: m0={:?} > m2={:?}", self.replica, m0, m2);
             return;
-        }
-
-        // We may receive delayed packets after a reboot, in which case m0/m2 may be invalid:
-        if m0 < self.window.monotonic {
-            warn!(
-                "{}: learn: m0={:?} < window.monotonic={:?}",
-                self.replica, m0, self.window.monotonic
-            );
+        } // Invalid sample
+        if m0 < self.window.monotonic_start {
             return;
-        }
+        } // Stale sample from before window
 
-        if m2 < self.window.monotonic {
-            warn!(
-                "{}: learn: m2={:?} < window.monotonic={:?}",
-                self.replica, m2, self.window.monotonic
-            );
-            return;
-        }
-
-        let elapsed = m2.duration_since(self.window.monotonic);
-        if elapsed > WINDOW_MAX {
-            warn!(
-                "{}: learn: elapsed={:?} > window_max={:?}",
-                self.replica, elapsed, WINDOW_MAX
-            );
-            return;
-        }
-
-        let round_trip_time = m2.duration_since(m0);
+        let round_trip_time = m2 - m0;
         let one_way_delay = round_trip_time / 2;
-        let t2 = self.window.realtime + elapsed.as_nanos() as i64;
-        let clock_offset = t1 + one_way_delay.as_nanos() as i64 - t2;
-        let asymmetric_delay = self.estimate_asymmetric_delay(replica, one_way_delay, clock_offset);
-        let clock_offset_corrected = clock_offset + asymmetric_delay;
+        let elapsed_in_window = m2 - self.window.monotonic_start;
+        let t2 = self.window.realtime_start + elapsed_in_window as i64;
+        let clock_offset = (t1 + one_way_delay as i64) - t2;
 
-        debug!(
-            "{}: learn: replica={} m0={:?} t1={} m2={:?} t2={} one_way_delay={:?} \
-             asymmetric_delay={} clock_offset={}",
-            self.replica,
-            replica,
-            m0,
-            t1,
-            m2,
-            t2,
+        let new_sample = Sample {
+            clock_offset,
             one_way_delay,
-            asymmetric_delay,
-            clock_offset_corrected
-        );
+        };
 
-        // The less network delay, the more likely we have an accurate clock offset measurement:
-        self.window.sources[replica as usize] = minimum_one_way_delay(
-            self.window.sources[replica as usize],
-            Some(Sample {
-                clock_offset: clock_offset_corrected,
-                one_way_delay,
-            }),
-        );
-
-        self.window.samples += 1;
-
-        // We decouple calls to `synchronize()` so that it's not triggered by these network events.
-        // Otherwise, excessive duplicate network packets would burn the CPU.
-        self.window.learned = true;
-    }
-
-    /// Called by `Replica.on_ping_timeout()` to provide `m0` when we decide to send a ping.
-    /// Called by `Replica.on_pong()` to provide `m2` when we receive a pong.
-    pub fn monotonic(&self) -> Instant {
-        self.time.monotonic()
-    }
-
-    /// Called by `Replica.on_ping()` when responding to a ping with a pong.
-    /// This should never be used by the state machine, only for measuring clock offsets.
-    pub fn realtime(&self) -> i64 {
-        self.time.realtime()
-    }
-
-    /// Called by `StateMachine.prepare_timestamp()` when the leader wants to timestamp a batch.
-    /// If the leader's clock is not synchronized with the cluster, it must wait until it is.
-    /// Returns the system time clamped to be within our synchronized lower and upper bounds.
-    /// This is complementary to NTP and allows clusters with very accurate time to make use of it,
-    /// while providing guard rails for when NTP is partitioned or unable to correct quickly enough.
-    pub fn realtime_synchronized(&self) -> Option<i64> {
-        if self.synchronization_disabled {
-            Some(self.realtime())
-        } else if let Some(interval) = &self.epoch.synchronized {
-            let elapsed = self.epoch.elapsed(self).as_nanos() as i64;
-            Some(cmp::max(
-                cmp::min(
-                    self.realtime(),
-                    self.epoch.realtime + elapsed + interval.upper_bound,
-                ),
-                self.epoch.realtime + elapsed + interval.lower_bound,
-            ))
-        } else {
-            None
+        // Keep the sample with the minimum one-way delay, as it's the most accurate.
+        let existing = &mut self.window.sources[remote_replica_id as usize];
+        if existing.is_none() || one_way_delay < existing.unwrap().one_way_delay {
+            *existing = Some(new_sample);
         }
     }
 
+    /// The main tick function, called periodically to advance time and attempt synchronization.
     pub fn tick(&mut self) {
-        self.time.tick();
-
+        self.time_source.tick();
         if self.synchronization_disabled {
             return;
         }
 
         self.synchronize();
 
-        // Expire the current epoch if successive windows failed to synchronize:
-        // Gradual clock drift prevents us from using an epoch for more than a few seconds.
-        if self.epoch.elapsed(self) >= EPOCH_MAX {
-            error!(
-                "{}: no agreement on cluster time (partitioned or too many clock faults)",
-                self.replica
+        // Expire the current epoch if it's too old.
+        let epoch_max_ns = config::CLOCK_EPOCH_MAX_MS * NS_PER_MS;
+        if self.epoch.elapsed_ns(&self.time_source) >= epoch_max_ns {
+            self.epoch = Epoch::new(
+                self.window.sources.len() as u8,
+                &mut self.time_source,
+                self.replica_id,
             );
-            self.reset_epoch();
         }
     }
 
-    /// Estimates the asymmetric delay for a sample compared to the previous window, according to
-    /// Algorithm 1 from Section 4.2, "A System for Clock Synchronization in an Internet of Things".
-    fn estimate_asymmetric_delay(
-        &self,
-        replica: u8,
-        one_way_delay: Duration,
-        clock_offset: i64,
-    ) -> i64 {
-        // Note that `one_way_delay` may be 0 for very fast networks.
-
-        let error_margin = Duration::from_millis(10).as_nanos() as i64;
-
-        if let Some(epoch) = self.epoch.sources[replica as usize] {
-            if one_way_delay <= epoch.one_way_delay {
-                0
-            } else if clock_offset > epoch.clock_offset + error_margin {
-                // The asymmetric error is on the forward network path.
-                -((one_way_delay - epoch.one_way_delay).as_nanos() as i64)
-            } else if clock_offset < epoch.clock_offset - error_margin {
-                // The asymmetric error is on the reverse network path.
-                (one_way_delay - epoch.one_way_delay).as_nanos() as i64
-            } else {
-                0
-            }
-        } else {
-            0
-        }
-    }
-
+    /// Attempts to create a new synchronized epoch from the current sample window.
     fn synchronize(&mut self) {
-        assert!(self.window.synchronized.is_none());
+        let window_min_ns = config::CLOCK_SYNCHRONIZATION_WINDOW_MIN_MS * NS_PER_MS;
+        let window_max_ns = config::CLOCK_SYNCHRONIZATION_WINDOW_MAX_MS * NS_PER_MS;
+        let elapsed = self.window.elapsed_ns(&self.time_source);
 
-        // Wait until the window has enough accurate samples:
-        let elapsed = self.window.elapsed(self);
-        if elapsed < WINDOW_MIN {
+        if elapsed < window_min_ns {
             return;
         }
-        if elapsed >= WINDOW_MAX {
-            // We took too long to synchronize the window, expire stale samples...
-            let sources_sampled = self.window.sources_sampled();
-            if sources_sampled <= self.window.sources.len() / 2 {
-                error!(
-                    "{}: synchronization failed, partitioned (sources={} samples={})",
-                    self.replica, sources_sampled, self.window.samples
-                );
-            } else {
-                error!(
-                    "{}: synchronization failed, no agreement (sources={} samples={})",
-                    self.replica, sources_sampled, self.window.samples
-                );
+
+        if elapsed >= window_max_ns {
+            // Window expired, start a new one.
+            self.window = Epoch::new(
+                self.window.sources.len() as u8,
+                &mut self.time_source,
+                self.replica_id,
+            );
+            return;
+        }
+
+        // Prepare tuples for Marzullo's algorithm.
+        let mut tuple_count = 0;
+        let tolerance = config::CLOCK_OFFSET_TOLERANCE_MAX_MS * NS_PER_MS;
+        for sample_opt in &self.window.sources {
+            if let Some(sample) = sample_opt {
+                let error_margin = (sample.one_way_delay + tolerance) as i64;
+                self.marzullo_tuples[tuple_count] = marzullo::Tuple {
+                    offset: sample.clock_offset - error_margin,
+                    bound: marzullo::Bound::Lower,
+                };
+                self.marzullo_tuples[tuple_count + 1] = marzullo::Tuple {
+                    offset: sample.clock_offset + error_margin,
+                    bound: marzullo::Bound::Upper,
+                };
+                tuple_count += 2;
             }
-            self.reset_window();
-            return;
         }
 
-        if !self.window.learned {
-            return;
+        let interval = Marzullo::smallest_interval(&mut self.marzullo_tuples[..tuple_count]);
+        let replica_count = self.window.sources.len();
+        let majority = (replica_count / 2) + 1;
+
+        // If we have a majority agreement, promote the window to the new epoch.
+        if interval.sources_true as usize >= majority {
+            self.epoch = std::mem::replace(
+                &mut self.window,
+                Epoch::new(replica_count as u8, &mut self.time_source, self.replica_id),
+            );
+            self.epoch.synchronized = Some(interval);
         }
-        // Do not reset `learned` any earlier than this (before we have attempted to synchronize).
-        self.window.learned = false;
-
-        // Starting with the most clock offset tolerance, while we have a majority, find the best
-        // smallest interval with the least clock offset tolerance, reducing tolerance at each step:
-        let mut tolerance = CLOCK_OFFSET_TOLERANCE_MAX;
-        let mut terminate = false;
-        let mut rounds = 0;
-
-        // Do at least one round if tolerance=0 and cap the number of rounds to avoid runaway loops.
-        while !terminate && rounds < 64 {
-            if tolerance == Duration::ZERO {
-                terminate = true;
-            }
-            rounds += 1;
-
-            let tuples = self.window_tuples(tolerance);
-            let interval = Marzullo::smallest_interval(&mut tuples.clone());
-            let majority = interval.sources_true > (self.window.sources.len() / 2) as u8;
-
-            if !majority {
-                break;
-            }
-
-            // The new interval may reduce the number of `sources_true` while also decreasing error.
-            // In other words, provided we maintain a majority, we prefer tighter tolerance bounds.
-            self.window.synchronized = Some(interval);
-
-            tolerance = tolerance / 2;
-        }
-
-        // Wait for more accurate samples or until we timeout the window for lack of majority:
-        if self.window.synchronized.is_none() {
-            return;
-        }
-
-        std::mem::swap(&mut self.epoch, &mut self.window);
-        self.reset_window();
-
-        self.after_synchronization();
     }
 
-    fn after_synchronization(&self) {
-        let new_interval = self.epoch.synchronized.as_ref().unwrap();
+    /// Returns the current synchronized time, or None if the clock is not synchronized.
+    pub fn realtime_synchronized(&mut self) -> Option<i64> {
+        if self.synchronization_disabled {
+            return Some(self.time_source.realtime());
+        }
 
-        debug!(
-            "{}: synchronized: truechimers={}/{} clock_offset={}..{} accuracy={}",
-            self.replica,
-            new_interval.sources_true,
-            self.epoch.sources.len(),
-            format_duration_signed(new_interval.lower_bound),
-            format_duration_signed(new_interval.upper_bound),
-            format_duration_signed(new_interval.upper_bound - new_interval.lower_bound),
-        );
+        if let Some(interval) = self.epoch.synchronized {
+            let elapsed = self.epoch.elapsed_ns(&self.time_source) as i64;
+            let system_realtime = self.time_source.realtime();
 
-        let elapsed = self.epoch.elapsed(self).as_nanos() as i64;
-        let system = self.realtime();
-        let lower = self.epoch.realtime + elapsed + new_interval.lower_bound;
-        let upper = self.epoch.realtime + elapsed + new_interval.upper_bound;
-        let cluster = cmp::max(cmp::min(system, upper), lower);
+            let lower_bound = self.epoch.realtime_start + elapsed + interval.lower_bound;
+            let upper_bound = self.epoch.realtime_start + elapsed + interval.upper_bound;
 
-        if system == cluster {
-            // System time is within bounds
-        } else if system < lower {
-            let delta = lower - system;
-            if delta < Duration::from_millis(1).as_nanos() as i64 {
-                info!(
-                    "{}: system time is {} behind",
-                    self.replica,
-                    format_duration_signed(delta)
-                );
-            } else {
-                error!(
-                    "{}: system time is {} behind, clamping system time to cluster time",
-                    self.replica,
-                    format_duration_signed(delta)
-                );
-            }
+            // Clamp the system's wall-clock time to be within the synchronized bounds.
+            Some(system_realtime.clamp(lower_bound, upper_bound))
         } else {
-            let delta = system - upper;
-            if delta < Duration::from_millis(1).as_nanos() as i64 {
-                info!(
-                    "{}: system time is {} ahead",
-                    self.replica,
-                    format_duration_signed(delta)
-                );
-            } else {
-                error!(
-                    "{}: system time is {} ahead, clamping system time to cluster time",
-                    self.replica,
-                    format_duration_signed(delta)
-                );
-            }
+            None
         }
     }
 
-    fn window_tuples(&mut self, tolerance: Duration) -> Vec<Tuple> {
-        assert_eq!(
-            self.window.sources[self.replica as usize]
-                .unwrap()
-                .clock_offset,
-            0
-        );
-        assert_eq!(
-            self.window.sources[self.replica as usize]
-                .unwrap()
-                .one_way_delay,
-            Duration::ZERO
-        );
-
-        self.marzullo_tuples.clear();
-
-        for (source, sample) in self.window.sources.iter().enumerate() {
-            if let Some(sample) = sample {
-                let tolerance_ns = tolerance.as_nanos() as i64;
-                let one_way_delay_ns = sample.one_way_delay.as_nanos() as i64;
-
-                self.marzullo_tuples.push(Tuple {
-                    source: source as u8,
-                    offset: sample.clock_offset - (one_way_delay_ns + tolerance_ns),
-                    bound: Bound::Lower,
-                });
-                self.marzullo_tuples.push(Tuple {
-                    source: source as u8,
-                    offset: sample.clock_offset + (one_way_delay_ns + tolerance_ns),
-                    bound: Bound::Upper,
-                });
-            }
-        }
-
-        self.marzullo_tuples.clone()
-    }
-
-    fn reset_epoch(&mut self) {
-        let monotonic = self.time.monotonic();
-        let realtime = self.time.realtime();
-        self.epoch.reset(self.replica, monotonic, realtime);
-    }
-
-    fn reset_window(&mut self) {
-        let monotonic = self.time.monotonic();
-        let realtime = self.time.realtime();
-        self.window.reset(self.replica, monotonic, realtime);
-    }
-}
-
-fn minimum_one_way_delay(a: Option<Sample>, b: Option<Sample>) -> Option<Sample> {
-    match (a, b) {
-        (None, b) => b,
-        (a, None) => a,
-        (Some(a), Some(b)) => {
-            if a.one_way_delay < b.one_way_delay {
-                Some(a)
-            } else {
-                // Choose B if B's one way delay is less or the same (we assume B is the newer sample):
-                Some(b)
-            }
-        }
-    }
-}
-
-// Helper function to format durations with sign (simplified version)
-fn format_duration_signed(nanos: i64) -> String {
-    if nanos >= 0 {
-        format!("{}ns", nanos)
-    } else {
-        format!("-{}ns", -nanos)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-    struct MockTime {
-        monotonic_time: Instant,
-        realtime: i64,
-    }
-
-    impl MockTime {
-        fn new() -> Self {
-            Self {
-                monotonic_time: Instant::now(),
-                realtime: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64,
-            }
-        }
-    }
-
-    impl Time for MockTime {
-        fn monotonic(&self) -> Instant {
-            self.monotonic_time
-        }
-
-        fn realtime(&self) -> i64 {
-            self.realtime
-        }
-
-        fn tick(&mut self) {
-            // Mock implementation
-        }
-    }
-
-    #[test]
-    fn test_clock_creation() {
-        let time = MockTime::new();
-        let clock = Clock::new(3, 0, time);
-
-        assert_eq!(clock.replica, 0);
-        assert!(!clock.synchronization_disabled);
-        assert!(clock.realtime_synchronized().is_none());
-    }
-
-    #[test]
-    fn test_single_replica_cluster() {
-        let time = MockTime::new();
-        let clock = Clock::new(1, 0, time);
-
-        assert!(clock.synchronization_disabled);
-        assert!(clock.realtime_synchronized().is_some());
+    pub fn time_source_mut(&mut self) -> &mut T {
+        &mut self.time_source
     }
 }

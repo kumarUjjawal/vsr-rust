@@ -1,4 +1,4 @@
 mod client;
-mod clock;
-mod journal;
+pub mod clock;
+pub mod journal;
 mod marzullo;

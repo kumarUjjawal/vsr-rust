@@ -1,5 +1,6 @@
 mod config;
 mod message_pool;
+mod replica;
 mod ring_buffer;
 mod services;
 mod sim;

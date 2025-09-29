@@ -76,6 +76,11 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
             offset: 0,
         }
     }
+
+    pub fn clear(&mut self) {
+        self.index = 0;
+        self.count = 0;
+    }
 }
 
 impl<T, const SIZE: usize> Default for RingBuffer<T, SIZE> {

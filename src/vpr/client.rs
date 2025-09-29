@@ -174,7 +174,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         self.register_if_needed();
     }
 
-    async fn on_reply(&mut self, reply_message: PooledMessage) {
+    fn on_reply(&mut self, reply_message: PooledMessage) {
         let reply_header = *reply_message.header();
 
         if reply_header.client != self.id {
@@ -216,7 +216,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
             network_message
                 .buffer
                 .copy_from_slice(&next_request.message.buffer);
-            self.send_request_for_the_first_time(network_message).await;
+            self.send_request_for_the_first_time(network_message);
         }
 
         if inflight.message.header().operation != Operation::Register {
@@ -228,7 +228,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         }
     }
 
-    async fn on_ping_timeout(&mut self) {
+    fn on_ping_timeout(&mut self) {
         self.ping_timeout.reset();
         let mut message = self.message_pool.get_message().expect("Pool exhausted");
         let header = message.header_mut();
@@ -240,13 +240,11 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         for i in 0..self.replica_count {
             let mut network_message = self.message_pool.get_message().expect("Pool exhausted");
             network_message.buffer.copy_from_slice(&message.buffer);
-            self.message_bus
-                .send_message_to_replica(i, network_message)
-                .await;
+            self.message_bus.send_message_to_replica(i, network_message);
         }
     }
 
-    async fn on_request_timeout(&mut self) {
+    fn on_request_timeout(&mut self) {
         self.request_timeout.backoff(&mut self.prng);
 
         if let Some(inflight) = self.request_queue.front() {
@@ -261,12 +259,11 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
             network_message.update_checksums();
 
             self.message_bus
-                .send_message_to_replica(replica_index, network_message)
-                .await;
+                .send_message_to_replica(replica_index, network_message);
         }
     }
 
-    async fn send_request_for_the_first_time(&mut self, mut network_message: PooledMessage) {
+    fn send_request_for_the_first_time(&mut self, mut network_message: PooledMessage) {
         {
             let header = network_message.header_mut();
             header.parent = self.parent;
@@ -280,11 +277,10 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
 
         let leader_index = (self.view % self.replica_count as u32) as u8;
         self.message_bus
-            .send_message_to_replica(leader_index, network_message)
-            .await;
+            .send_message_to_replica(leader_index, network_message);
     }
 
-    async fn register_if_needed(&mut self) {
+    fn register_if_needed(&mut self) {
         if self.request_number > 0 {
             return;
         }
@@ -316,7 +312,7 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
             network_message
                 .buffer
                 .copy_from_slice(&self.request_queue.front().unwrap().message.buffer);
-            self.send_request_for_the_first_time(network_message).await;
+            self.send_request_for_the_first_time(network_message);
         }
     }
 }

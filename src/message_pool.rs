@@ -103,6 +103,22 @@ pub struct PooledMessage {
     pub pool: MessagePool,
 }
 
+impl PooledMessage {
+    /// Creates a new PooledMessage by getting a fresh buffer from the pool
+    /// and copying the contents of the current message into it.
+    pub fn clone_from_pool(&self) -> Self {
+        let mut new_message = self
+            .pool
+            .get_message()
+            .expect("Message pool exhausted during clone");
+
+        // Perform a deep copy of the buffer contents.
+        new_message.buffer.copy_from_slice(&self.message.buffer);
+
+        new_message
+    }
+}
+
 impl Deref for PooledMessage {
     type Target = Message;
     fn deref(&self) -> &Self::Target {

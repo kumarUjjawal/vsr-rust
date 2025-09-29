@@ -34,17 +34,18 @@ pub trait Storage: Send + Sync {
     async fn write_sectors(&self, buffer: &[u8], offset: u64) -> Result<(), StorageError>;
 }
 
+#[async_trait]
 pub trait MessageBus: Send + Sync + Debug {
-    fn send_message_to_replica(&self, replica_id: u8, message: PooledMessage);
+    async fn send_message_to_replica(&self, replica_id: u8, message: PooledMessage);
 
-    fn send_message_to_client(&self, client_id: u128, message: PooledMessage);
+    async fn send_message_to_client(&self, client_id: u128, message: PooledMessage);
 }
 
 /// This abstracts away system time, allowing for deterministic time during testing,
 pub trait TimeSource: Send + Sync {
     fn monotonic(&self) -> u64;
 
-    fn realtime(&self) -> i64;
+    fn realtime(&mut self) -> i64;
 
     fn tick(&mut self);
 }

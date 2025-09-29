@@ -1,10 +1,10 @@
 use crate::config;
 use std::mem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessType {
-    Replica,
-    Client,
+    Replica(u8),
+    Client(u128),
 }
 
 #[repr(u8)]

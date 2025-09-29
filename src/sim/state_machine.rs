@@ -11,7 +11,7 @@ pub struct HashingStateMachine {
     state: u128,
 }
 
-fn hash(state: u128, input: &[u8]) -> u128 {
+pub fn hash(state: u128, input: &[u8]) -> u128 {
     let mut key = [0u8; 32];
     key[..16].copy_from_slice(&state.to_le_bytes());
     let hash = blake3::keyed_hash(&key, input);
@@ -25,6 +25,14 @@ impl HashingStateMachine {
         Self {
             state: hash(0, &seed.to_le_bytes()),
         }
+    }
+
+    pub fn state(&self) -> u128 {
+        self.state
+    }
+
+    pub fn hash(state: u128, input: &[u8]) -> u128 {
+        hash(state, input)
     }
 }
 
@@ -56,5 +64,9 @@ impl StateMachine for HashingStateMachine {
                 unreachable!("Reserved/Init operations should not be committed by state machine");
             }
         }
+    }
+
+    fn state_hash(&self) -> u128 {
+        self.state
     }
 }

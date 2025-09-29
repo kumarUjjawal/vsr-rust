@@ -91,12 +91,14 @@ impl Timeout {
         self.ticks = 0;
         self.attempts = self.attempts.wrapping_add(1);
 
-        let _base_duration = self.rtt * self.rtt_multiple as u64;
-        let _backoff_duration = exponential_backoff_with_jitter(
+        let base = self.rtt * self.rtt_multiple as u64;
+        let jitter = exponential_backoff_with_jitter(
             rng,
             config::BACKOFF_MIN_TICKS as u64,
             config::BACKOFF_MAX_TICKS as u64,
             self.attempts,
         );
+
+        self.after = base.saturating_add(jitter);
     }
 }

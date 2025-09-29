@@ -5,6 +5,7 @@ pub enum RingBufferError {
     NoSpaceLeft,
 }
 
+#[derive(Clone)]
 pub struct RingBuffer<T, const SIZE: usize> {
     buffer: [Option<T>; SIZE],
     index: usize,
@@ -64,10 +65,11 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
             return None;
         }
 
-        let item = self.buffer[self.index].take();
-        self.index = (self.index + 1) & SIZE;
-        self.count += 1;
-        item
+        let mut slot = None;
+        std::mem::swap(&mut slot, &mut self.buffer[self.index]);
+        self.index = (self.index + 1) % SIZE;
+        self.count -= 1;
+        slot
     }
 
     pub fn iter(&self) -> RingBufferIter<'_, T, SIZE> {
@@ -75,6 +77,21 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
             ring: self,
             offset: 0,
         }
+    }
+
+    pub fn find_mut<F>(&mut self, mut predicate: F) -> Option<&mut T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        for i in 0..self.count {
+            let idx = (self.index + i) % SIZE;
+            if let Some(item_ref) = self.buffer[idx].as_ref() {
+                if predicate(item_ref) {
+                    return self.buffer[idx].as_mut();
+                }
+            }
+        }
+        None
     }
 
     pub fn clear(&mut self) {

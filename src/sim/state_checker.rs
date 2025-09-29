@@ -1,6 +1,5 @@
 use crate::config;
 use crate::ring_buffer::RingBuffer;
-use crate::services::{MessageBus, StateMachine, Storage, TimeSource};
 use crate::sim::cluster::Cluster;
 use crate::sim::state_machine::HashingStateMachine;
 use std::collections::HashMap;
@@ -23,13 +22,7 @@ pub struct StateChecker {
 }
 
 impl StateChecker {
-    pub fn new<MB, SM, S, T>(cluster: &Cluster<MB, SM, S, T>) -> Self
-    where
-        MB: MessageBus + 'static,
-        SM: StateMachine + Send + 'static,
-        S: Storage + Send + Sync + 'static,
-        T: TimeSource + Send + 'static,
-    {
+    pub fn new(cluster: &Cluster) -> Self {
         let state = cluster.replicas[0].state_machine_hash();
         let mut state_machine_states = vec![0; cluster.replicas.len()];
 
@@ -46,7 +39,9 @@ impl StateChecker {
         history.insert(state, 0);
 
         Self {
-            client_requests: vec![RequestQueue::new(); cluster.clients.len()],
+            client_requests: std::iter::repeat_with(RequestQueue::new)
+                .take(cluster.clients.len())
+                .collect(),
             state_machine_states,
             history,
             state,
@@ -55,13 +50,7 @@ impl StateChecker {
     }
 
     /// Checks the state of a replica. Panics if the state is invalid or divergent.
-    pub fn check_state<MB, SM, S, T>(&mut self, replica_id: u8, cluster: &Cluster<MB, SM, S, T>)
-    where
-        MB: MessageBus + 'static,
-        SM: StateMachine + Send + 'static,
-        S: Storage + Send + Sync + 'static,
-        T: TimeSource + Send + 'static,
-    {
+    pub fn check_state(&mut self, replica_id: u8, cluster: &Cluster) {
         let replica_state = cluster.replicas[replica_id as usize].state_machine_hash();
         let previous_replica_state = self.state_machine_states[replica_id as usize];
 

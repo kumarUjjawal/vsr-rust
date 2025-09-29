@@ -75,6 +75,10 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         client
     }
 
+    pub fn id(&self) -> u128 {
+        self.id
+    }
+
     pub fn request(
         &mut self,
         user_data: u128,
@@ -240,7 +244,9 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         for i in 0..self.replica_count {
             let mut network_message = self.message_pool.get_message().expect("Pool exhausted");
             network_message.buffer.copy_from_slice(&message.buffer);
-            self.message_bus.send_message_to_replica(i, network_message);
+            let _ = self
+                .message_bus
+                .send_message_to_replica(i, network_message);
         }
     }
 
@@ -258,7 +264,8 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
 
             network_message.update_checksums();
 
-            self.message_bus
+            let _ = self
+                .message_bus
                 .send_message_to_replica(replica_index, network_message);
         }
     }
@@ -276,7 +283,8 @@ impl<MB: MessageBus + Debug + 'static> Client<MB> {
         self.request_timeout.start();
 
         let leader_index = (self.view % self.replica_count as u32) as u8;
-        self.message_bus
+        let _ = self
+            .message_bus
             .send_message_to_replica(leader_index, network_message);
     }
 

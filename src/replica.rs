@@ -7,7 +7,7 @@ use crate::vpr::clock::Clock;
 use crate::vpr::journal::Journal;
 use crate::vsr::{Command, Header, Operation};
 use rand::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ pub enum Status {
 /// An entry in the client table, caching the latest reply for a client's session.
 struct ClientTableEntry {
     session: u64,
+    last_request: u32,
     reply: PooledMessage,
 }
 
@@ -59,6 +60,8 @@ pub struct Replica<MB: MessageBus, SM: StateMachine, S: Storage, T: TimeSource> 
     journal: Journal<S>,
     clock: Clock<T>,
     state_machine: SM,
+
+    log: BTreeMap<u64, PooledMessage>,
 
     // Replica Configuration
     cluster: u32,
@@ -149,6 +152,7 @@ where
             journal,
             clock,
             state_machine,
+            log: BTreeMap::new(),
             cluster,
             replica_count,
             replica_id,
@@ -162,7 +166,9 @@ where
             pipeline: RingBuffer::new(),
             view_normal: init_prepare_header.view,
             start_view_change_from_other_replicas: QuorumCounter::default(),
-            do_view_change_from_all_replicas: vec![None; replica_count as usize],
+            do_view_change_from_all_replicas: std::iter::repeat_with(|| None)
+                .take(replica_count as usize)
+                .collect(),
             start_view_change_quorum: false,
             do_view_change_quorum: false,
             ping_timeout: Timeout::new("ping_timeout", replica_id as u128, 100),
@@ -192,5 +198,662 @@ where
     /// Helper function to determine if this replica is the leader in the current view.
     fn is_leader(&self) -> bool {
         (self.view % self.replica_count as u32) as u8 == self.replica_id
+    }
+
+    pub async fn tick(&mut self) {
+        self.clock.tick();
+        self.ping_timeout.tick();
+        self.prepare_timeout.tick();
+        self.commit_timeout.tick();
+        self.normal_status_timeout.tick();
+        self.view_change_status_timeout.tick();
+
+        if self.ping_timeout.fired() {
+            self.on_ping_timeout().await;
+        }
+        if self.prepare_timeout.fired() {
+            self.on_prepare_timeout().await;
+        }
+        if self.commit_timeout.fired() {
+            self.on_commit_timeout().await;
+        }
+        if self.normal_status_timeout.fired() {
+            self.on_normal_status_timeout().await;
+        }
+        if self.view_change_status_timeout.fired() {
+            self.on_view_change_status_timeout().await;
+        }
+    }
+
+    pub fn state_machine_hash(&self) -> u128 {
+        self.state_machine.state_hash()
+    }
+
+    pub async fn on_message(&mut self, message: PooledMessage) {
+        match message.header().command {
+            Command::Request => self.handle_request(message).await,
+            Command::Prepare => self.handle_prepare(message).await,
+            Command::PrepareOk => self.handle_prepare_ok(message).await,
+            Command::Commit => self.handle_commit(message).await,
+            Command::StartViewChange => self.handle_start_view_change(message).await,
+            Command::DoViewChange => self.handle_do_view_change(message).await,
+            Command::StartView => self.handle_start_view(message).await,
+            Command::RequestStartView => self.handle_request_start_view(message).await,
+            _ => {}
+        }
+    }
+
+    async fn handle_request(&mut self, message: PooledMessage) {
+        if !self.is_leader() || self.status != Status::Normal {
+            return;
+        }
+
+        let request_header = *message.header();
+
+        let client_id = request_header.client;
+
+        if request_header.operation != Operation::Register {
+            match self.client_table.get(&client_id) {
+                Some(entry) => {
+                    if request_header.context != entry.session as u128 {
+                        return;
+                    }
+                    if request_header.request <= entry.last_request {
+                        let mut reply = entry.reply.clone_from_pool();
+                        reply.header_mut().replica = self.replica_id;
+                        self.message_bus
+                            .send_message_to_client(client_id, reply)
+                            .await;
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
+
+        let op = self.op + 1;
+
+        let mut prepare_message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        let total_size = request_header.size as usize;
+        prepare_message.buffer[..total_size]
+            .copy_from_slice(&message.buffer[..total_size]);
+
+        {
+            let prepare_header = prepare_message.header_mut();
+            prepare_header.command = Command::Prepare;
+            prepare_header.view = self.view;
+            prepare_header.replica = self.replica_id;
+            prepare_header.op = op;
+            prepare_header.commit = self.commit;
+            prepare_header.parent = message.header().checksum;
+            prepare_header.size = request_header.size;
+        }
+        prepare_message.update_checksums();
+
+        let mut entry = Prepare {
+            message: prepare_message,
+            ok_from_replicas: QuorumCounter::default(),
+            ok_quorum_received: false,
+        };
+        entry.ok_from_replicas.set(self.replica_id);
+
+        let log_clone = entry.message.clone_from_pool();
+        self.log.insert(op, log_clone);
+
+        self.pipeline.push_assume_capacity(entry);
+        self.op = op;
+
+        let mut outbound = Vec::new();
+        if let Some(stored) = self.log.get(&op) {
+            for replica_id in 0..self.replica_count {
+                if replica_id == self.replica_id {
+                    continue;
+                }
+                let mut clone = stored.clone_from_pool();
+                clone.header_mut().replica = self.replica_id;
+                outbound.push((replica_id, clone));
+            }
+        }
+
+        for (replica_id, msg) in outbound {
+            self.message_bus
+                .send_message_to_replica(replica_id, msg)
+                .await;
+        }
+    }
+
+    async fn handle_prepare(&mut self, message: PooledMessage) {
+        let header = *message.header();
+
+        if header.op <= self.commit {
+            return;
+        }
+
+        self.op = self.op.max(header.op);
+        self.log.insert(header.op, message);
+
+        let mut ack = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+
+        {
+            let ack_header = ack.header_mut();
+            ack_header.command = Command::PrepareOk;
+            ack_header.operation = header.operation;
+            ack_header.cluster = self.cluster;
+            ack_header.client = header.client;
+            ack_header.context = header.checksum;
+            ack_header.request = header.request;
+            ack_header.view = header.view;
+            ack_header.op = header.op;
+            ack_header.commit = self.commit;
+            ack_header.replica = self.replica_id;
+            ack_header.size = std::mem::size_of::<Header>() as u32;
+            ack_header.set_checksums(&[]);
+        }
+
+        let target = header.replica;
+        self.message_bus
+            .send_message_to_replica(target, ack)
+            .await;
+    }
+
+    async fn handle_prepare_ok(&mut self, message: PooledMessage) {
+        if !self.is_leader() {
+            return;
+        }
+
+        let header = *message.header();
+
+        let op = header.op;
+
+        if let Some(prepare) = self
+            .pipeline
+            .find_mut(|p| p.message.header().op == op)
+        {
+            let sender = header.replica;
+            if !prepare.ok_from_replicas.is_set(sender) {
+                prepare.ok_from_replicas.set(sender);
+                if !prepare.ok_quorum_received
+                    && prepare.ok_from_replicas.count() as u8 >= self.quorum_replication
+                {
+                    prepare.ok_quorum_received = true;
+                }
+            }
+        }
+
+        self.commit_ready_prepares().await;
+    }
+
+    async fn handle_commit(&mut self, message: PooledMessage) {
+        let target_commit = message.header().commit;
+        if target_commit <= self.commit {
+            return;
+        }
+
+        let mut next = self.commit + 1;
+        while next <= target_commit {
+            self.apply_commit(next, None, false).await;
+            next += 1;
+        }
+
+        if message.header().op > self.op {
+            self.op = message.header().op;
+        }
+    }
+
+    async fn handle_start_view_change(&mut self, message: PooledMessage) {
+        let header = *message.header();
+        if header.replica == self.replica_id {
+            return;
+        }
+
+        if header.view > self.view {
+            self.transition_to_view_change_status(header.view).await;
+        }
+
+        if self.status != Status::ViewChange || header.view != self.view {
+            return;
+        }
+
+        if !self.start_view_change_from_other_replicas.is_set(header.replica) {
+            self.start_view_change_from_other_replicas.set(header.replica);
+        }
+
+        let others = self.start_view_change_from_other_replicas.count() as u8;
+        let threshold = self.quorum_view_change.saturating_sub(1);
+        if !self.start_view_change_quorum && others >= threshold {
+            self.start_view_change_quorum = true;
+            self.send_do_view_change().await;
+        }
+    }
+
+    async fn handle_do_view_change(&mut self, message: PooledMessage) {
+        let header = *message.header();
+        if !self.is_leader() {
+            return;
+        }
+
+        if header.view > self.view {
+            self.transition_to_view_change_status(header.view).await;
+        }
+
+        if self.status != Status::ViewChange || header.view != self.view {
+            return;
+        }
+
+        if let Some(existing) = &mut self.do_view_change_from_all_replicas[header.replica as usize] {
+            *existing = message;
+        } else {
+            self.do_view_change_from_all_replicas[header.replica as usize] = Some(message);
+        }
+
+        let received = self
+            .do_view_change_from_all_replicas
+            .iter()
+            .filter(|m| m.is_some())
+            .count() as u8;
+
+        if !self.do_view_change_quorum && received >= self.quorum_view_change {
+            self.do_view_change_quorum = true;
+            self.enter_normal_status().await;
+            self.send_start_view().await;
+        }
+    }
+
+    async fn handle_start_view(&mut self, message: PooledMessage) {
+        let header = *message.header();
+        if header.replica == self.replica_id {
+            return;
+        }
+
+        if header.view > self.view {
+            self.transition_to_view_change_status(header.view).await;
+        }
+
+        self.view = header.view;
+        self.commit = header.commit;
+        self.op = header.op.max(self.op);
+        self.enter_normal_status().await;
+    }
+
+    async fn handle_request_start_view(&mut self, message: PooledMessage) {
+        if !self.is_leader() || self.status != Status::Normal {
+            return;
+        }
+
+        let mut header = Header::default();
+        header.command = Command::StartView;
+        header.cluster = self.cluster;
+        header.replica = self.replica_id;
+        header.view = self.view;
+        header.op = self.op;
+        header.commit = self.commit;
+
+        let mut reply = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        *reply.header_mut() = header;
+        reply.update_checksums();
+
+        self.message_bus
+            .send_message_to_replica(message.header().replica, reply)
+            .await;
+    }
+
+    async fn commit_ready_prepares(&mut self) {
+        loop {
+            let ready = match self.pipeline.front() {
+                Some(prepare) if prepare.ok_quorum_received => Some(prepare.message.header().op),
+                _ => None,
+            };
+
+            let Some(op) = ready else { break };
+
+            if let Some(prepare) = self.pipeline.pop() {
+                self.apply_commit(op, Some(prepare.message), true).await;
+            } else {
+                break;
+            }
+        }
+    }
+
+    async fn apply_commit(
+        &mut self,
+        op: u64,
+        message_override: Option<PooledMessage>,
+        reply_to_client: bool,
+    ) {
+        let prepare_message = match message_override {
+            Some(msg) => {
+                self.log.remove(&op);
+                msg
+            }
+            None => match self.log.remove(&op) {
+                Some(msg) => msg,
+                None => return,
+            },
+        };
+
+        let header = *prepare_message.header();
+        if header.operation == Operation::Init {
+            self.commit = op;
+            return;
+        }
+
+        let header_size = std::mem::size_of::<Header>();
+        let body_len = header
+            .size
+            .saturating_sub(header_size as u32) as usize;
+        let body = &prepare_message.buffer[header_size..][..body_len];
+
+        let mut reply_message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        let output = &mut reply_message.buffer[header_size..];
+        let written = self
+            .state_machine
+            .commit(header.client, header.operation, body, output);
+
+        {
+            let reply_header = reply_message.header_mut();
+            reply_header.command = Command::Reply;
+            reply_header.operation = header.operation;
+            reply_header.parent = header.context;
+            reply_header.client = header.client;
+            reply_header.request = header.request;
+            reply_header.cluster = self.cluster;
+            reply_header.replica = self.replica_id;
+            reply_header.view = self.view;
+            reply_header.op = op;
+            reply_header.commit = op;
+            reply_header.size = (header_size + written) as u32;
+        }
+        reply_message.update_checksums();
+
+        self.commit = op;
+
+        if reply_to_client {
+            let stored_reply = reply_message.clone_from_pool();
+            match header.operation {
+                Operation::Register => {
+                    let client_id = header.client;
+                    self.client_table.insert(
+                        client_id,
+                        ClientTableEntry {
+                            session: op,
+                            last_request: header.request,
+                            reply: stored_reply,
+                        },
+                    );
+                }
+                _ => {
+                    let client_id = header.client;
+                    if let Some(entry) = self.client_table.get_mut(&client_id) {
+                        entry.last_request = header.request;
+                        entry.reply = stored_reply;
+                        entry.session = entry.session.max(header.context as u64);
+                    } else {
+                        self.client_table.insert(
+                            client_id,
+                            ClientTableEntry {
+                                session: header.context as u64,
+                                last_request: header.request,
+                                reply: stored_reply,
+                            },
+                        );
+                    }
+                }
+            }
+
+            let client_id = header.client;
+            self.message_bus
+                .send_message_to_client(client_id, reply_message)
+                .await;
+
+            let mut commit_messages = Vec::new();
+            for replica_id in 0..self.replica_count {
+                if replica_id == self.replica_id {
+                    continue;
+                }
+                let mut commit_msg = self
+                    .message_pool
+                    .get_message()
+                    .expect("message pool exhausted");
+                {
+                    let commit_header = commit_msg.header_mut();
+                    commit_header.command = Command::Commit;
+                    commit_header.cluster = self.cluster;
+                    commit_header.view = self.view;
+                    commit_header.op = op;
+                    commit_header.commit = op;
+                    commit_header.replica = self.replica_id;
+                    commit_header.size = header_size as u32;
+                }
+                commit_msg.update_checksums();
+                commit_messages.push((replica_id, commit_msg));
+            }
+
+            for (replica_id, commit_msg) in commit_messages {
+                self.message_bus
+                    .send_message_to_replica(replica_id, commit_msg)
+                    .await;
+            }
+        }
+    }
+
+    async fn on_ping_timeout(&mut self) {
+        self.ping_timeout.reset();
+
+        if self.status != Status::Normal {
+            return;
+        }
+
+        let monotonic = self.clock.time_source_mut().monotonic();
+        let mut header = Header::default();
+        header.command = Command::Ping;
+        header.cluster = self.cluster;
+        header.view = self.view;
+        header.op = monotonic;
+
+        self.broadcast_header(header).await;
+    }
+
+    async fn on_prepare_timeout(&mut self) {
+        if self.status != Status::Normal || !self.is_leader() {
+            self.prepare_timeout.reset();
+            return;
+        }
+
+        let Some(prepare) = self.pipeline.front() else {
+            self.prepare_timeout.reset();
+            return;
+        };
+
+        if prepare.ok_quorum_received {
+            self.prepare_timeout.reset();
+            self.commit_ready_prepares().await;
+            return;
+        }
+
+        let mut to_send = Vec::new();
+        for replica_id in 0..self.replica_count {
+            if replica_id == self.replica_id {
+                continue;
+            }
+            if !prepare.ok_from_replicas.is_set(replica_id) {
+                to_send.push((replica_id, prepare.message.clone_from_pool()));
+            }
+        }
+
+        if to_send.is_empty() {
+            self.prepare_timeout.reset();
+            return;
+        }
+
+        self.prepare_timeout.backoff(&mut self.prng);
+
+        for (replica_id, message) in to_send {
+            self.message_bus
+                .send_message_to_replica(replica_id, message)
+                .await;
+        }
+    }
+
+    async fn on_commit_timeout(&mut self) {
+        self.commit_timeout.reset();
+
+        if self.status != Status::Normal || !self.is_leader() {
+            return;
+        }
+
+        let mut header = Header::default();
+        header.command = Command::Commit;
+        header.cluster = self.cluster;
+        header.view = self.view;
+        header.op = self.op;
+        header.commit = self.commit;
+
+        self.broadcast_header(header).await;
+    }
+
+    async fn on_normal_status_timeout(&mut self) {
+        self.normal_status_timeout.reset();
+        let next_view = self.view + 1;
+        self.transition_to_view_change_status(next_view).await;
+    }
+
+    async fn on_view_change_status_timeout(&mut self) {
+        self.view_change_status_timeout.reset();
+        let next_view = self.view + 1;
+        self.transition_to_view_change_status(next_view).await;
+    }
+
+    async fn broadcast_header(&self, mut header: Header) {
+        header.replica = self.replica_id;
+        header.size = std::mem::size_of::<Header>() as u32;
+        header.set_checksums(&[]);
+
+        let mut messages = Vec::new();
+        for replica_id in 0..self.replica_count {
+            if replica_id == self.replica_id {
+                continue;
+            }
+            let mut message = self
+                .message_pool
+                .get_message()
+                .expect("message pool exhausted");
+            *message.header_mut() = header;
+            message.update_checksums();
+            messages.push((replica_id, message));
+        }
+
+        for (replica_id, message) in messages {
+            self.message_bus
+                .send_message_to_replica(replica_id, message)
+                .await;
+        }
+    }
+
+    async fn transition_to_view_change_status(&mut self, new_view: u32) {
+        if new_view <= self.view {
+            return;
+        }
+
+        self.view = new_view;
+        self.status = Status::ViewChange;
+        self.ping_timeout.stop();
+        self.commit_timeout.stop();
+        self.normal_status_timeout.stop();
+        self.view_change_status_timeout.start();
+
+        self.reset_pipeline();
+        self.reset_view_change_tracking();
+
+        self.send_start_view_change().await;
+    }
+
+    fn reset_pipeline(&mut self) {
+        while self.pipeline.pop().is_some() {}
+    }
+
+    fn reset_view_change_tracking(&mut self) {
+        self.start_view_change_from_other_replicas.clear();
+        for slot in &mut self.do_view_change_from_all_replicas {
+            if let Some(msg) = slot.take() {
+                drop(msg);
+            }
+        }
+        self.start_view_change_quorum = false;
+        self.do_view_change_quorum = false;
+    }
+
+    async fn send_start_view_change(&mut self) {
+        let mut header = Header::default();
+        header.command = Command::StartViewChange;
+        header.cluster = self.cluster;
+        header.view = self.view;
+        self.broadcast_header(header).await;
+    }
+
+    async fn send_do_view_change(&mut self) {
+        self.start_view_change_quorum = true;
+
+        let mut header = Header::default();
+        header.command = Command::DoViewChange;
+        header.cluster = self.cluster;
+        header.view = self.view;
+        header.op = self.op;
+        header.commit = self.commit;
+        header.offset = self.view_normal as u64;
+
+        let leader = (self.view % self.replica_count as u32) as u8;
+        header.replica = self.replica_id;
+        header.size = std::mem::size_of::<Header>() as u32;
+        header.set_checksums(&[]);
+
+        let mut message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        *message.header_mut() = header;
+        message.update_checksums();
+
+        self.message_bus
+            .send_message_to_replica(leader, message)
+            .await;
+    }
+
+    async fn send_start_view(&mut self) {
+        self.enter_normal_status().await;
+
+        let mut header = Header::default();
+        header.command = Command::StartView;
+        header.cluster = self.cluster;
+        header.view = self.view;
+        header.op = self.op;
+        header.commit = self.commit;
+
+        self.broadcast_header(header).await;
+    }
+
+    async fn enter_normal_status(&mut self) {
+        self.status = Status::Normal;
+        self.view_normal = self.view;
+        self.view_change_status_timeout.stop();
+        self.reset_view_change_tracking();
+
+        if self.is_leader() {
+            self.ping_timeout.start();
+            self.commit_timeout.start();
+        } else {
+            self.normal_status_timeout.start();
+        }
     }
 }

@@ -22,6 +22,9 @@ pub trait StateMachine: Send + Sync {
         input: &[u8],
         output: &mut [u8],
     ) -> usize;
+
+    /// Returns the current hash/digest of the state machine.
+    fn state_hash(&self) -> u128;
 }
 
 #[derive(Debug)]

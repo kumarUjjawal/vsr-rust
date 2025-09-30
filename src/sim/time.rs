@@ -88,6 +88,24 @@ impl DeterministicTime {
     }
 }
 
+impl DeterministicTime {
+    /// Creates a deterministic clock with a linear offset model and the
+    /// provided tick resolution. Matches the defaults used by the reference
+    /// simulator so that Rust replicas experience the same clock drift.
+    pub fn with_linear_model(resolution: u64, seed: u64) -> Self {
+        Self {
+            resolution,
+            offset_type: OffsetType::Linear,
+            offset_coefficient_a: 0,
+            offset_coefficient_b: 0,
+            offset_coefficient_c: 0,
+            prng: StdRng::seed_from_u64(seed),
+            ticks: 0,
+            epoch: 0,
+        }
+    }
+}
+
 impl TimeSource for DeterministicTime {
     fn monotonic(&self) -> u64 {
         self.ticks * self.resolution

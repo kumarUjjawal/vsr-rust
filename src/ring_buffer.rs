@@ -28,6 +28,10 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
         self.count == 0
     }
 
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
     pub fn front(&self) -> Option<&T> {
         if self.is_empty() {
             None

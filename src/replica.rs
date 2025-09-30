@@ -6,6 +6,7 @@ use crate::timeout::Timeout;
 use crate::vpr::clock::Clock;
 use crate::vpr::journal::Journal;
 use crate::vsr::{Command, Header, Operation, sector_ceil};
+use log::{debug, error, warn};
 use rand::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -262,82 +263,78 @@ where
         }
     }
 
-    async fn handle_request(&mut self, message: PooledMessage) {
-        if !self.is_leader() || self.status != Status::Normal {
+    async fn handle_request(&mut self, mut message: PooledMessage) {
+        if self.ignore_request_message(&message).await {
             return;
         }
 
-        if self.replica_id == 0 {
-            println!("leader received request");
-        }
-
         let request_header = *message.header();
-
-        let client_id = request_header.client;
-
-        if request_header.operation != Operation::Register {
-            match self.client_table.get(&client_id) {
-                Some(entry) => {
-                    if request_header.context != entry.session as u128 {
-                        return;
-                    }
-                    if request_header.request <= entry.last_request {
-                        let mut reply = entry.reply.clone_from_pool();
-                        reply.header_mut().replica = self.replica_id;
-                        self.message_bus
-                            .send_message_to_client(client_id, reply)
-                            .await;
-                        return;
-                    }
-                }
-                None => return,
+        let request_checksum = request_header.checksum;
+        let realtime = match self.clock.realtime_synchronized() {
+            Some(ts) => ts,
+            None => {
+                error!(
+                    "replica {}: dropping request {} (clock not synchronized)",
+                    self.replica_id, request_checksum
+                );
+                return;
             }
-        }
+        };
 
+        debug!(
+            "replica {}: on_request: processing request {}",
+            self.replica_id, request_checksum
+        );
+
+        self.state_machine
+            .prepare(realtime, request_header.operation, message.body());
+
+        let parent_checksum = self
+            .journal
+            .entry_for_op_exact(self.op)
+            .map(|header| header.checksum)
+            .expect("missing journal entry for current op");
         let op = self.op + 1;
 
-        let mut prepare_message = self
-            .message_pool
-            .get_message()
-            .expect("message pool exhausted");
-        let total_size = request_header.size as usize;
-        prepare_message.buffer[..total_size]
-            .copy_from_slice(&message.buffer[..total_size]);
-
         {
-            let prepare_header = prepare_message.header_mut();
+            let prepare_header = message.header_mut();
             prepare_header.command = Command::Prepare;
             prepare_header.view = self.view;
             prepare_header.replica = self.replica_id;
             prepare_header.op = op;
             prepare_header.commit = self.commit;
-            prepare_header.parent = message.header().checksum;
-            prepare_header.size = request_header.size;
+            prepare_header.parent = parent_checksum;
+            prepare_header.context = request_checksum;
+            if prepare_header.offset == 0 {
+                prepare_header.offset = self.next_journal_offset;
+            }
         }
-        prepare_message.update_checksums();
-        self.persist_prepare_message(&mut prepare_message).await;
+        message.update_checksums();
+        self.persist_prepare_message(&mut message).await;
 
+        let log_clone = message.clone_from_pool();
+        self.log.insert(op, log_clone);
+        let pipeline_was_empty = self.pipeline.is_empty();
         let mut entry = Prepare {
-            message: prepare_message,
+            message,
             ok_from_replicas: QuorumCounter::default(),
             ok_quorum_received: false,
         };
         entry.ok_from_replicas.set(self.replica_id);
-
-        let log_clone = entry.message.clone_from_pool();
-        self.log.insert(op, log_clone);
-        if let Some(stored) = self.log.get(&op) {
-            println!(
-                "leader stored command {:?} for op {}",
-                stored.header().command, op
-            );
+        if entry.ok_from_replicas.count() as u8 >= self.quorum_replication {
+            entry.ok_quorum_received = true;
         }
-
         self.pipeline.push_assume_capacity(entry);
         self.op = op;
 
-        if self.is_leader() && op <= 5 {
-            println!("leader {} enqueued op {}", self.replica_id, op);
+        if pipeline_was_empty {
+            if self.prepare_timeout.ticking {
+                self.prepare_timeout.reset();
+            } else {
+                self.prepare_timeout.start();
+            }
+        } else if !self.prepare_timeout.ticking {
+            self.prepare_timeout.start();
         }
 
         let mut outbound = Vec::new();
@@ -357,6 +354,260 @@ where
                 .send_message_to_replica(replica_id, msg)
                 .await;
         }
+
+        if self.is_leader() {
+            self.commit_ready_prepares().await;
+        }
+    }
+
+    async fn ignore_request_message(&mut self, message: &PooledMessage) -> bool {
+        if self.status != Status::Normal {
+            debug!(
+                "replica {}: on_request: ignoring ({:?})",
+                self.replica_id, self.status
+            );
+            return true;
+        }
+
+        if self.ignore_request_message_follower(message).await {
+            return true;
+        }
+        if self.ignore_request_message_duplicate(message).await {
+            return true;
+        }
+        if self.ignore_request_message_preparing(message) {
+            return true;
+        }
+
+        false
+    }
+
+    async fn ignore_request_message_follower(&mut self, message: &PooledMessage) -> bool {
+        let header = *message.header();
+
+        if header.view > self.view {
+            debug!(
+                "replica {}: on_request: ignoring (newer view)",
+                self.replica_id
+            );
+            return true;
+        }
+
+        if self.is_leader() {
+            return false;
+        }
+
+        if header.operation == Operation::Register {
+            debug!(
+                "replica {}: on_request: ignoring (follower, register)",
+                self.replica_id
+            );
+            return true;
+        }
+
+        if header.view < self.view {
+            debug!(
+                "replica {}: on_request: forwarding (follower)",
+                self.replica_id
+            );
+
+            let leader = self.leader_index(self.view);
+            let mut forwarded = message.clone_from_pool();
+            forwarded.header_mut().replica = self.replica_id;
+            forwarded.update_checksums();
+
+            self.message_bus
+                .send_message_to_replica(leader, forwarded)
+                .await;
+        } else {
+            debug!(
+                "replica {}: on_request: ignoring (follower, same view)",
+                self.replica_id
+            );
+        }
+
+        true
+    }
+
+    async fn ignore_request_message_duplicate(&mut self, message: &PooledMessage) -> bool {
+        let header = *message.header();
+        let client_id = header.client;
+
+        if client_id == 0 {
+            error!(
+                "replica {}: on_request: ignoring (client id = 0)",
+                self.replica_id
+            );
+            return true;
+        }
+
+        if let Some(entry) = self.client_table.get(&client_id) {
+            if header.operation != Operation::Register {
+                let session = header.context as u64;
+                if entry.session > session {
+                    error!(
+                        "replica {}: on_request: ignoring older session (client bug)",
+                        self.replica_id
+                    );
+                    return true;
+                } else if entry.session < session {
+                    error!(
+                        "replica {}: on_request: ignoring newer session (client bug)",
+                        self.replica_id
+                    );
+                    return true;
+                }
+            }
+
+            let reply_header = *entry.reply.header();
+
+            if reply_header.request > header.request {
+                debug!(
+                    "replica {}: on_request: ignoring older request",
+                    self.replica_id
+                );
+                if header.request < 10 {
+                    let req = header.request;
+                    let prev_req = reply_header.request;
+                    println!(
+                        "debug: replica {} ignoring older request {} (> {})",
+                        self.replica_id, req, prev_req
+                    );
+                }
+                return true;
+            } else if reply_header.request == header.request {
+                if header.checksum == reply_header.parent {
+                    let mut reply = entry.reply.clone_from_pool();
+                    reply.header_mut().replica = self.replica_id;
+                    reply.update_checksums();
+
+                    debug!(
+                        "replica {}: on_request: replying to duplicate request",
+                        self.replica_id
+                    );
+                    self.message_bus
+                        .send_message_to_client(client_id, reply)
+                        .await;
+                } else {
+                    error!(
+                        "replica {}: on_request: request collision (client bug)",
+                        self.replica_id
+                    );
+                }
+                return true;
+            } else if reply_header.request + 1 == header.request {
+                if header.parent == reply_header.checksum {
+                    debug!("replica {}: on_request: new request", self.replica_id);
+                    return false;
+                } else {
+                    error!(
+                        "replica {}: on_request: ignoring new request (client bug)",
+                        self.replica_id
+                    );
+                    if header.request < 10 {
+                        let parent = header.parent;
+                        let expected = reply_header.checksum;
+                        println!(
+                            "debug: replica {} new request parent mismatch: got {} expect {}",
+                            self.replica_id, parent, expected
+                        );
+                    }
+                    return true;
+                }
+            } else {
+                error!(
+                    "replica {}: on_request: ignoring newer request (client bug)",
+                    self.replica_id
+                );
+                if header.request < 10 {
+                    let req = header.request;
+                    let prev_req = reply_header.request;
+                    println!(
+                        "debug: replica {} rejecting request {} with entry request {}",
+                        self.replica_id, req, prev_req
+                    );
+                }
+                return true;
+            }
+        } else if header.operation == Operation::Register {
+            debug!("replica {}: on_request: new session", self.replica_id);
+            return false;
+        } else if self.pipeline_prepare_for_client(client_id).is_some() {
+            debug!(
+                "replica {}: on_request: waiting for session to commit",
+                self.replica_id
+            );
+            return true;
+        } else {
+            error!("replica {}: on_request: no session", self.replica_id);
+            self.send_eviction_message_to_client(client_id).await;
+            return true;
+        }
+    }
+
+    fn ignore_request_message_preparing(&self, message: &PooledMessage) -> bool {
+        assert!(self.status == Status::Normal);
+        assert!(self.is_leader());
+
+        let header = message.header();
+
+        if let Some(prepare) = self.pipeline_prepare_for_client(header.client) {
+            let prepare_header = prepare.message.header();
+            if header.checksum == prepare_header.context {
+                debug!(
+                    "replica {}: on_request: ignoring (already preparing)",
+                    self.replica_id
+                );
+            } else {
+                error!(
+                    "replica {}: on_request: ignoring (client forked)",
+                    self.replica_id
+                );
+            }
+            return true;
+        }
+
+        if self.pipeline.is_full() {
+            debug!(
+                "replica {}: on_request: ignoring (pipeline full)",
+                self.replica_id
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn pipeline_prepare_for_client(&self, client_id: u128) -> Option<&Prepare> {
+        self.pipeline
+            .iter()
+            .find(|prepare| prepare.message.header().client == client_id)
+    }
+
+    async fn send_eviction_message_to_client(&mut self, client_id: u128) {
+        warn!(
+            "replica {}: too many sessions, sending eviction to client {}",
+            self.replica_id, client_id
+        );
+
+        let mut message = self
+            .message_pool
+            .get_message()
+            .expect("message pool exhausted");
+        {
+            let header = message.header_mut();
+            header.command = Command::Eviction;
+            header.cluster = self.cluster;
+            header.replica = self.replica_id;
+            header.view = self.view;
+            header.client = client_id;
+            header.size = std::mem::size_of::<Header>() as u32;
+        }
+        message.update_checksums();
+
+        self.message_bus
+            .send_message_to_client(client_id, message)
+            .await;
     }
 
     async fn handle_prepare(&mut self, mut message: PooledMessage) {
@@ -378,14 +629,6 @@ where
         self.persist_prepare_message(&mut message).await;
 
         self.log.insert(header.op, message.clone_from_pool());
-
-        let op = header.op;
-        let sender = header.replica;
-        let view = header.view;
-        println!(
-            "replica {} handling prepare op {} from {} in view {}",
-            self.replica_id, op, sender, view
-        );
 
         let mut ack = self
             .message_pool
@@ -409,9 +652,7 @@ where
         }
 
         let target = header.replica;
-        self.message_bus
-            .send_message_to_replica(target, ack)
-            .await;
+        self.message_bus.send_message_to_replica(target, ack).await;
     }
 
     async fn handle_prepare_ok(&mut self, message: PooledMessage) {
@@ -423,10 +664,7 @@ where
 
         let op = header.op;
 
-        if let Some(prepare) = self
-            .pipeline
-            .find_mut(|p| p.message.header().op == op)
-        {
+        if let Some(prepare) = self.pipeline.find_mut(|p| p.message.header().op == op) {
             let sender = header.replica;
             if !prepare.ok_from_replicas.is_set(sender) {
                 prepare.ok_from_replicas.set(sender);
@@ -480,8 +718,12 @@ where
             return;
         }
 
-        if !self.start_view_change_from_other_replicas.is_set(header.replica) {
-            self.start_view_change_from_other_replicas.set(header.replica);
+        if !self
+            .start_view_change_from_other_replicas
+            .is_set(header.replica)
+        {
+            self.start_view_change_from_other_replicas
+                .set(header.replica);
         }
 
         let others = self.start_view_change_from_other_replicas.count() as u8;
@@ -506,7 +748,8 @@ where
             return;
         }
 
-        if let Some(existing) = &mut self.do_view_change_from_all_replicas[header.replica as usize] {
+        if let Some(existing) = &mut self.do_view_change_from_all_replicas[header.replica as usize]
+        {
             *existing = message;
         } else {
             self.do_view_change_from_all_replicas[header.replica as usize] = Some(message);
@@ -622,8 +865,7 @@ where
 
         for prepare in &prepares {
             let size = prepare.header().size as usize;
-            reply.buffer[cursor..cursor + size]
-                .copy_from_slice(&prepare.buffer[..size]);
+            reply.buffer[cursor..cursor + size].copy_from_slice(&prepare.buffer[..size]);
             cursor += size;
         }
 
@@ -674,6 +916,30 @@ where
 
     async fn handle_ping(&mut self, message: PooledMessage) {
         let header = *message.header();
+
+        if header.client != 0 {
+            if self.status == Status::Normal {
+                let mut pong = self
+                    .message_pool
+                    .get_message()
+                    .expect("message pool exhausted");
+                {
+                    let pong_header = pong.header_mut();
+                    pong_header.command = Command::Pong;
+                    pong_header.cluster = self.cluster;
+                    pong_header.replica = self.replica_id;
+                    pong_header.view = self.view;
+                    pong_header.size = std::mem::size_of::<Header>() as u32;
+                }
+                pong.update_checksums();
+
+                self.message_bus
+                    .send_message_to_client(header.client, pong)
+                    .await;
+            }
+            return;
+        }
+
         if header.replica == self.replica_id {
             return;
         }
@@ -686,6 +952,11 @@ where
             }
         }
 
+        let realtime = {
+            let ts = self.clock.time_source_mut();
+            ts.realtime()
+        };
+
         let mut pong = self
             .message_pool
             .get_message()
@@ -696,8 +967,8 @@ where
             pong_header.cluster = self.cluster;
             pong_header.replica = self.replica_id;
             pong_header.view = self.view;
-            pong_header.op = self.op;
-            pong_header.commit = self.commit;
+            pong_header.op = header.op;
+            pong_header.offset = u64::from_ne_bytes(realtime.to_ne_bytes());
             pong_header.size = std::mem::size_of::<Header>() as u32;
         }
         pong.update_checksums();
@@ -707,9 +978,29 @@ where
             .await;
     }
 
-    async fn handle_pong(&mut self, _message: PooledMessage) {}
+    async fn handle_pong(&mut self, message: PooledMessage) {
+        let header = *message.header();
+
+        if header.client != 0 {
+            return;
+        }
+
+        if header.replica == self.replica_id {
+            return;
+        }
+
+        let m0 = header.op;
+        let t1 = i64::from_ne_bytes(header.offset.to_ne_bytes());
+        let m2 = {
+            let ts = self.clock.time_source_mut();
+            ts.monotonic()
+        };
+
+        self.clock.learn(header.replica, m0, t1, m2);
+    }
 
     async fn commit_ready_prepares(&mut self) {
+        let mut committed_any = false;
         loop {
             let ready = match self.pipeline.front() {
                 Some(prepare) if prepare.ok_quorum_received => Some(prepare.message.header().op),
@@ -717,12 +1008,16 @@ where
             };
 
             let Some(op) = ready else { break };
-
             if let Some(prepare) = self.pipeline.pop() {
                 self.apply_commit(op, Some(prepare.message), true).await;
+                committed_any = true;
             } else {
                 break;
             }
+        }
+
+        if committed_any && self.pipeline.is_empty() && self.prepare_timeout.ticking {
+            self.prepare_timeout.stop();
         }
     }
 
@@ -750,9 +1045,7 @@ where
         }
 
         let header_size = std::mem::size_of::<Header>();
-        let body_len = header
-            .size
-            .saturating_sub(header_size as u32) as usize;
+        let body_len = header.size.saturating_sub(header_size as u32) as usize;
         let body = &prepare_message.buffer[header_size..][..body_len];
 
         let mut reply_message = self
@@ -808,16 +1101,9 @@ where
                     if let Some(entry) = self.client_table.get_mut(&client_id) {
                         entry.last_request = header.request;
                         entry.reply = stored_reply;
-                        entry.session = entry.session.max(header.context as u64);
                     } else {
-                        self.client_table.insert(
-                            client_id,
-                            ClientTableEntry {
-                                session: header.context as u64,
-                                last_request: header.request,
-                                reply: stored_reply,
-                            },
-                        );
+                        // Session entry may have been evicted; deliver the reply but do not insert.
+                        drop(stored_reply);
                     }
                 }
             }
@@ -879,9 +1165,7 @@ where
         let total = message.header().size as usize;
 
         while offset + header_size <= total {
-            let prepare_header = unsafe {
-                &*(message.buffer[offset..].as_ptr() as *const Header)
-            };
+            let prepare_header = unsafe { &*(message.buffer[offset..].as_ptr() as *const Header) };
             let size = prepare_header.size as usize;
             if size == 0 || offset + size > total {
                 break;
@@ -891,8 +1175,7 @@ where
                 .message_pool
                 .get_message()
                 .expect("message pool exhausted");
-            cloned.buffer[..size]
-                .copy_from_slice(&message.buffer[offset..offset + size]);
+            cloned.buffer[..size].copy_from_slice(&message.buffer[offset..offset + size]);
             cloned.update_checksums();
             result.push(cloned);
             offset += size;
@@ -908,8 +1191,7 @@ where
         self.advance_journal_offset(message.header());
         let header_copy = *message.header();
         self.journal.set_entry_as_dirty(&header_copy);
-        self
-            .journal
+        self.journal
             .write_prepare(message)
             .await
             .expect("failed to persist prepare");
@@ -1109,9 +1391,7 @@ where
                     ack_header.size = std::mem::size_of::<Header>() as u32;
                 }
                 ack.update_checksums();
-                self.message_bus
-                    .send_message_to_replica(leader, ack)
-                    .await;
+                self.message_bus.send_message_to_replica(leader, ack).await;
             }
         }
     }
@@ -1138,8 +1418,7 @@ where
 
         for prepare in &prepares {
             let size = prepare.header().size as usize;
-            message.buffer[cursor..cursor + size]
-                .copy_from_slice(&prepare.buffer[..size]);
+            message.buffer[cursor..cursor + size].copy_from_slice(&prepare.buffer[..size]);
             cursor += size;
         }
 
@@ -1178,8 +1457,7 @@ where
 
         for prepare in &prepares {
             let size = prepare.header().size as usize;
-            message.buffer[cursor..cursor + size]
-                .copy_from_slice(&prepare.buffer[..size]);
+            message.buffer[cursor..cursor + size].copy_from_slice(&prepare.buffer[..size]);
             cursor += size;
         }
 
@@ -1204,9 +1482,7 @@ where
         }
 
         for (replica, msg) in messages {
-            self.message_bus
-                .send_message_to_replica(replica, msg)
-                .await;
+            self.message_bus.send_message_to_replica(replica, msg).await;
         }
     }
 

@@ -5,8 +5,9 @@ use std::fmt::Debug;
 
 /// A trait representing the application-specific state machine.
 ///
-/// This is the Rust equivalent of the `StateMachine` comptime parameter in Zig.
-/// The `Replica` will call these methods to apply committed operations.
+/// The protocol uses a pluggable state machine; replicas invoke these hooks to
+/// stage and commit operations against whatever implementation the simulator
+/// is wired up with.
 pub trait StateMachine: Send + Sync {
     /// Called by the leader to inform the state machine of a potential operation,
     /// allowing it to perform any necessary pre-processing or validation

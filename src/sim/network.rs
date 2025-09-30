@@ -1,13 +1,18 @@
-use crate::config;
 use crate::message_pool::{MessagePool, PooledMessage};
 use crate::services::MessageBus;
-use crate::sim::packet_simulator::{self, PacketSimulator, PartitionMode};
+use crate::sim::packet_simulator::{self, PacketSimulator};
 use crate::vsr;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{self, Duration, Interval};
+use tokio::task::yield_now;
+
+#[derive(Clone)]
+pub struct NetworkOptions {
+    pub packet_simulator: packet_simulator::Options,
+}
 
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -17,7 +22,8 @@ pub struct Packet {
 #[derive(Debug)]
 enum NetworkCommand {
     Send {
-        path: packet_simulator::Path,
+        source: vsr::ProcessType,
+        target: vsr::ProcessType,
         packet: Packet,
     },
     Deliver {
@@ -35,35 +41,33 @@ pub struct SimulatedMessageBus {
 #[async_trait]
 impl MessageBus for SimulatedMessageBus {
     async fn send_message_to_replica(&self, replica_id: u8, message: PooledMessage) {
-        let source_addr = self.process_id.to_address();
-        let path = packet_simulator::Path {
-            source: source_addr,
-            target: replica_id,
-        };
         let packet = Packet {
             buffer: message.buffer.to_vec(),
         };
         println!(
-            "bus {:?} sending to replica {} (source {})",
-            self.process_id, replica_id, source_addr
+            "bus {:?} sending to replica {}",
+            self.process_id, replica_id
         );
         self.sender
-            .send(NetworkCommand::Send { path, packet })
+            .send(NetworkCommand::Send {
+                source: self.process_id,
+                target: vsr::ProcessType::Replica(replica_id),
+                packet,
+            })
             .await
             .ok();
     }
 
     async fn send_message_to_client(&self, client_id: u128, message: PooledMessage) {
-        let target_addr = (config::REPLICAS_MAX as u128 + client_id) as u8;
-        let path = packet_simulator::Path {
-            source: self.process_id.to_address(),
-            target: target_addr,
-        };
         let packet = Packet {
             buffer: message.buffer.to_vec(),
         };
         self.sender
-            .send(NetworkCommand::Send { path, packet })
+            .send(NetworkCommand::Send {
+                source: self.process_id,
+                target: vsr::ProcessType::Client(client_id),
+                packet,
+            })
             .await
             .ok();
     }
@@ -73,30 +77,14 @@ pub struct Network {
     packet_simulator: PacketSimulator<Packet>,
     address_to_process: HashMap<u8, vsr::ProcessType>,
     process_to_sender: HashMap<vsr::ProcessType, Sender<PooledMessage>>,
+    process_to_address: HashMap<vsr::ProcessType, u8>,
     command_receiver: Receiver<NetworkCommand>,
     command_sender: Sender<NetworkCommand>,
     message_pool: MessagePool,
-    tick_interval: Interval,
 }
 
 impl Network {
-    pub fn new(replica_count: u8, _client_count: u8, message_pool: MessagePool) -> Self {
-        let node_count = config::REPLICAS_MAX as u8 + config::CLIENTS_MAX as u8;
-        let options = packet_simulator::Options {
-            one_way_delay_mean: 10,
-            one_way_delay_min: 1,
-            packet_loss_probability: 5,
-            packet_replay_probability: 1,
-            seed: 1234,
-            replica_count,
-            node_count,
-            partition_mode: PartitionMode::IsolateSingle,
-            partition_probability: 1,
-            unpartition_probability: 10,
-            partition_stability: 200,
-            unpartition_stability: 50,
-        };
-
+    pub fn new(message_pool: MessagePool, options: NetworkOptions) -> Self {
         let (command_sender, command_receiver) = mpsc::channel(256);
         let network_sender_clone = command_sender.clone();
 
@@ -106,16 +94,16 @@ impl Network {
                 .ok();
         });
 
-        let packet_simulator = PacketSimulator::new(options, delivery_callback);
+        let packet_simulator = PacketSimulator::new(options.packet_simulator, delivery_callback);
 
         Self {
             packet_simulator,
             address_to_process: HashMap::new(),
             process_to_sender: HashMap::new(),
+            process_to_address: HashMap::new(),
             command_receiver,
             command_sender,
             message_pool,
-            tick_interval: time::interval(Duration::from_millis(config::TICK_MS as u64)),
         }
     }
 
@@ -123,9 +111,9 @@ impl Network {
         &mut self,
         process: vsr::ProcessType,
     ) -> (SimulatedMessageBus, Receiver<PooledMessage>) {
-        let address = process.to_address();
+        let address = self.address_to_process.len() as u8;
         assert!(
-            !self.address_to_process.contains_key(&address),
+            !self.process_to_address.contains_key(&process),
             "Process already registered"
         );
 
@@ -133,6 +121,7 @@ impl Network {
 
         self.address_to_process.insert(address, process);
         self.process_to_sender.insert(process, tx);
+        self.process_to_address.insert(process, address);
 
         let bus = SimulatedMessageBus {
             sender: self.command_sender.clone(),
@@ -143,39 +132,45 @@ impl Network {
 
     pub async fn run(&mut self) {
         loop {
-            tokio::select! {
-                _ = self.tick_interval.tick() => {
-                    self.packet_simulator.tick();
-                }
-                Some(command) = self.command_receiver.recv() => {
-                    match command {
-                        NetworkCommand::Send { path, packet } => {
+            match self.command_receiver.try_recv() {
+                Ok(command) => match command {
+                    NetworkCommand::Send {
+                        source,
+                        target,
+                        packet,
+                    } => {
+                        if let (Some(&source_addr), Some(&target_addr)) = (
+                            self.process_to_address.get(&source),
+                            self.process_to_address.get(&target),
+                        ) {
+                            let path = packet_simulator::Path {
+                                source: source_addr,
+                                target: target_addr,
+                            };
                             self.packet_simulator.submit_packet(packet, path);
                         }
-                        NetworkCommand::Deliver { path, packet } => {
-                            if let Some(process) = self.address_to_process.get(&path.target) {
-                                if let Some(sender) = self.process_to_sender.get(process) {
-                                    let mut pooled_message = self.message_pool.get_message().expect("Network ran out of messages");
-                                    pooled_message.buffer[..packet.buffer.len()].copy_from_slice(&packet.buffer);
+                    }
+                    NetworkCommand::Deliver { path, packet } => {
+                        if let Some(process) = self.address_to_process.get(&path.target) {
+                            if let Some(sender) = self.process_to_sender.get(process) {
+                                let mut pooled_message = self
+                                    .message_pool
+                                    .get_message()
+                                    .expect("Network ran out of messages");
+                                pooled_message.buffer[..packet.buffer.len()]
+                                    .copy_from_slice(&packet.buffer);
 
-                                    if sender.send(pooled_message).await.is_err() {
-                                         // Receiver was dropped, process likely terminated.
-                                    }
-                                }
+                                let _ = sender.send(pooled_message).await;
                             }
                         }
                     }
+                },
+                Err(TryRecvError::Empty) => {
+                    self.packet_simulator.tick();
+                    yield_now().await;
                 }
+                Err(TryRecvError::Disconnected) => break,
             }
-        }
-    }
-}
-
-impl vsr::ProcessType {
-    fn to_address(&self) -> u8 {
-        match self {
-            vsr::ProcessType::Replica(id) => *id,
-            vsr::ProcessType::Client(id) => (config::REPLICAS_MAX as u128 + *id) as u8,
         }
     }
 }

@@ -45,6 +45,14 @@ impl SimulatedStorage {
         }
     }
 
+    /// Resets any outstanding I/O state while keeping persisted bytes intact.
+    ///
+    /// The current implementation performs synchronous reads/writes and does
+    /// not maintain queued operations, but we still provide the hook so higher
+    /// level failure-injection logic can mimic the behaviour of the reference
+    /// simulator.
+    pub fn reset(&self) {}
+
     async fn simulate_latency(&self, min: u64, mean: u64) {
         if mean == 0 || mean <= min {
             return;
@@ -89,6 +97,112 @@ impl SimulatedStorage {
         let mem = self.memory.lock().unwrap();
         assert!(offset as usize + buffer.len() <= mem.len());
     }
+}
+
+pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> Vec<FaultyAreas> {
+    let message_size_max = config::MESSAGE_SIZE_MAX as u64;
+    let mut areas: Vec<FaultyAreas> = match replica_count {
+        0 => Vec::new(),
+        1 => vec![FaultyAreas {
+            first_offset: size,
+            period: 1,
+        }],
+        2 => vec![
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 4 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 4 * message_size_max,
+            },
+        ],
+        3 => vec![
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 4 * message_size_max,
+                period: 6 * message_size_max,
+            },
+        ],
+        4 => vec![
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 4 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 4 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 4 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 4 * message_size_max,
+            },
+        ],
+        5 => vec![
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 4 * message_size_max,
+                period: 6 * message_size_max,
+            },
+        ],
+        6 => vec![
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 0 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 2 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 4 * message_size_max,
+                period: 6 * message_size_max,
+            },
+            FaultyAreas {
+                first_offset: 4 * message_size_max,
+                period: 6 * message_size_max,
+            },
+        ],
+        _ => Vec::new(),
+    };
+
+    areas.truncate(replica_count as usize);
+    areas.shuffle(rng);
+    areas
 }
 
 #[async_trait]

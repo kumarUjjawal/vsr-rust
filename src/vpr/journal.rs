@@ -11,6 +11,27 @@ pub struct BitSet {
     len: u64,
 }
 
+#[repr(align(4096))]
+struct SectorAlignedBuffer {
+    bytes: [u8; config::SECTOR_SIZE],
+}
+
+impl SectorAlignedBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: [0; config::SECTOR_SIZE],
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
 impl BitSet {
     pub fn new(count: usize) -> Self {
         Self {
@@ -158,7 +179,7 @@ impl<S: Storage> Journal<S> {
         let header_sector_offset =
             vsr::sector_floor(header.op * std::mem::size_of::<Header>() as u64);
 
-        let mut temp_header_buffer: Vec<u8> = vec![0; config::SECTOR_SIZE];
+        let mut temp_header_buffer = SectorAlignedBuffer::new();
         let start = header_sector_offset as usize;
         let headers_as_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -167,7 +188,9 @@ impl<S: Storage> Journal<S> {
             )
         };
 
-        temp_header_buffer.copy_from_slice(&headers_as_bytes[start..start + config::SECTOR_SIZE]);
+        temp_header_buffer
+            .as_mut_slice()
+            .copy_from_slice(&headers_as_bytes[start..start + config::SECTOR_SIZE]);
 
         self.headers_version = (self.headers_version + 1) % 2;
         let version1 = self.headers_version;
@@ -176,12 +199,12 @@ impl<S: Storage> Journal<S> {
 
         let redundant_offset1 = self.offset_in_headers_version(header_sector_offset, version1);
         self.storage
-            .write_sectors(&temp_header_buffer, redundant_offset1)
+            .write_sectors(temp_header_buffer.as_slice(), redundant_offset1)
             .await?;
 
         let redundant_offset2 = self.offset_in_headers_version(header_sector_offset, version2);
         self.storage
-            .write_sectors(&temp_header_buffer, redundant_offset2)
+            .write_sectors(temp_header_buffer.as_slice(), redundant_offset2)
             .await?;
 
         self.dirty.clear(header.op);

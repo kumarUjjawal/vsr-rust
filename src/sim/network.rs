@@ -151,17 +151,17 @@ impl Network {
                         }
                     }
                     NetworkCommand::Deliver { path, packet } => {
-                        if let Some(process) = self.address_to_process.get(&path.target) {
-                            if let Some(sender) = self.process_to_sender.get(process) {
-                                let mut pooled_message = self
-                                    .message_pool
-                                    .get_message()
-                                    .expect("Network ran out of messages");
-                                pooled_message.buffer[..packet.buffer.len()]
-                                    .copy_from_slice(&packet.buffer);
+                        if let Some(process) = self.address_to_process.get(&path.target)
+                            && let Some(sender) = self.process_to_sender.get(process)
+                        {
+                            let mut pooled_message = self
+                                .message_pool
+                                .get_message()
+                                .expect("Network ran out of messages");
+                            pooled_message.buffer[..packet.buffer.len()]
+                                .copy_from_slice(&packet.buffer);
 
-                                let _ = sender.send(pooled_message).await;
-                            }
+                            let _ = sender.send(pooled_message).await;
                         }
                     }
                 },

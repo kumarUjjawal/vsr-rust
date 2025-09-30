@@ -89,10 +89,10 @@ impl<T, const SIZE: usize> RingBuffer<T, SIZE> {
     {
         for i in 0..self.count {
             let idx = (self.index + i) % SIZE;
-            if let Some(item_ref) = self.buffer[idx].as_ref() {
-                if predicate(item_ref) {
-                    return self.buffer[idx].as_mut();
-                }
+            if let Some(item_ref) = self.buffer[idx].as_ref()
+                && predicate(item_ref)
+            {
+                return self.buffer[idx].as_mut();
             }
         }
         None

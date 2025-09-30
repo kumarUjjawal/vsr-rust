@@ -625,7 +625,8 @@ pub struct TimeOut;
 
 /// Calculates the size of a buffer rounded up to the nearest sector size.
 pub fn sector_ceil(size: u64) -> u64 {
-    (size + config::SECTOR_SIZE as u64 - 1) / config::SECTOR_SIZE as u64
+    size
+        .div_ceil(config::SECTOR_SIZE as u64)
         * config::SECTOR_SIZE as u64
 }
 

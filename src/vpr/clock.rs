@@ -154,19 +154,17 @@ impl<T: TimeSource> Clock<T> {
         // Prepare tuples for Marzullo's algorithm.
         let mut tuple_count = 0;
         let tolerance = config::CLOCK_OFFSET_TOLERANCE_MAX_MS * NS_PER_MS;
-        for sample_opt in &self.window.sources {
-            if let Some(sample) = sample_opt {
-                let error_margin = (sample.one_way_delay + tolerance) as i64;
-                self.marzullo_tuples[tuple_count] = marzullo::Tuple {
-                    offset: sample.clock_offset - error_margin,
-                    bound: marzullo::Bound::Lower,
-                };
-                self.marzullo_tuples[tuple_count + 1] = marzullo::Tuple {
-                    offset: sample.clock_offset + error_margin,
-                    bound: marzullo::Bound::Upper,
-                };
-                tuple_count += 2;
-            }
+        for sample in self.window.sources.iter().flatten() {
+            let error_margin = (sample.one_way_delay + tolerance) as i64;
+            self.marzullo_tuples[tuple_count] = marzullo::Tuple {
+                offset: sample.clock_offset - error_margin,
+                bound: marzullo::Bound::Lower,
+            };
+            self.marzullo_tuples[tuple_count + 1] = marzullo::Tuple {
+                offset: sample.clock_offset + error_margin,
+                bound: marzullo::Bound::Upper,
+            };
+            tuple_count += 2;
         }
 
         let interval = Marzullo::smallest_interval(&mut self.marzullo_tuples[..tuple_count]);

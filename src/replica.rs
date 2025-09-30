@@ -107,6 +107,7 @@ where
     S: Storage + Send + Sync + 'static,
     T: TimeSource + Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         message_bus: Arc<MB>,
         message_pool: MessagePool,
@@ -450,7 +451,8 @@ where
                         self.replica_id
                     );
                     return true;
-                } else if entry.session < session {
+                }
+                if entry.session < session {
                     error!(
                         "replica {}: on_request: ignoring newer session (client bug)",
                         self.replica_id
@@ -474,7 +476,7 @@ where
                         self.replica_id, req, prev_req
                     );
                 }
-                return true;
+                true
             } else if reply_header.request == header.request {
                 if header.checksum == reply_header.parent {
                     let mut reply = entry.reply.clone_from_pool();
@@ -494,11 +496,11 @@ where
                         self.replica_id
                     );
                 }
-                return true;
+                true
             } else if reply_header.request + 1 == header.request {
                 if header.parent == reply_header.checksum {
                     debug!("replica {}: on_request: new request", self.replica_id);
-                    return false;
+                    false
                 } else {
                     error!(
                         "replica {}: on_request: ignoring new request (client bug)",
@@ -512,7 +514,7 @@ where
                             self.replica_id, parent, expected
                         );
                     }
-                    return true;
+                    true
                 }
             } else {
                 error!(
@@ -527,21 +529,21 @@ where
                         self.replica_id, req, prev_req
                     );
                 }
-                return true;
+                true
             }
         } else if header.operation == Operation::Register {
             debug!("replica {}: on_request: new session", self.replica_id);
-            return false;
+            false
         } else if self.pipeline_prepare_for_client(client_id).is_some() {
             debug!(
                 "replica {}: on_request: waiting for session to commit",
                 self.replica_id
             );
-            return true;
+            true
         } else {
             error!("replica {}: on_request: no session", self.replica_id);
             self.send_eviction_message_to_client(client_id).await;
-            return true;
+            true
         }
     }
 
@@ -564,18 +566,16 @@ where
                     self.replica_id
                 );
             }
-            return true;
-        }
-
-        if self.pipeline.is_full() {
+            true
+        } else if self.pipeline.is_full() {
             debug!(
                 "replica {}: on_request: ignoring (pipeline full)",
                 self.replica_id
             );
-            return true;
+            true
+        } else {
+            false
         }
-
-        false
     }
 
     fn pipeline_prepare_for_client(&self, client_id: u128) -> Option<&Prepare> {
@@ -754,7 +754,7 @@ where
         let received = self
             .do_view_change_from_all_replicas
             .iter()
-            .filter(|m| m.is_some())
+            .flatten()
             .count() as u8;
 
         if !self.do_view_change_quorum && received >= self.quorum_view_change {
@@ -764,22 +764,20 @@ where
             let mut best_commit = self.commit;
             let mut best_payload = self.clone_outstanding_prepares();
 
-            for msg_opt in &self.do_view_change_from_all_replicas {
-                if let Some(msg) = msg_opt {
-                    let candidate_view = msg.header().offset as u32;
-                    let candidate_commit = msg.header().commit;
-                    let candidate_prepares = self.prepares_from_payload(msg);
-                    let candidate_op = candidate_prepares
-                        .last()
-                        .map(|p| p.header().op)
-                        .unwrap_or(candidate_commit);
+            for msg in self.do_view_change_from_all_replicas.iter().flatten() {
+                let candidate_view = msg.header().offset as u32;
+                let candidate_commit = msg.header().commit;
+                let candidate_prepares = self.prepares_from_payload(msg);
+                let candidate_op = candidate_prepares
+                    .last()
+                    .map(|p| p.header().op)
+                    .unwrap_or(candidate_commit);
 
-                    if (candidate_view, candidate_op) > (best_view, best_op) {
-                        best_view = candidate_view;
-                        best_op = candidate_op;
-                        best_commit = candidate_commit;
-                        best_payload = candidate_prepares;
-                    }
+                if (candidate_view, candidate_op) > (best_view, best_op) {
+                    best_view = candidate_view;
+                    best_op = candidate_op;
+                    best_commit = candidate_commit;
+                    best_payload = candidate_prepares;
                 }
             }
 
@@ -865,14 +863,16 @@ where
             cursor += size;
         }
 
-        let mut header = Header::default();
-        header.command = Command::StartView;
-        header.cluster = self.cluster;
-        header.replica = self.replica_id;
-        header.view = self.view;
-        header.op = self.op;
-        header.commit = self.commit;
-        header.size = cursor as u32;
+        let header = Header {
+            command: Command::StartView,
+            cluster: self.cluster,
+            replica: self.replica_id,
+            view: self.view,
+            op: self.op,
+            commit: self.commit,
+            size: cursor as u32,
+            ..Header::default()
+        };
         *reply.header_mut() = header;
         reply.update_checksums();
 
@@ -1201,11 +1201,13 @@ where
         }
 
         let monotonic = self.clock.time_source_mut().monotonic();
-        let mut header = Header::default();
-        header.command = Command::Ping;
-        header.cluster = self.cluster;
-        header.view = self.view;
-        header.op = monotonic;
+        let header = Header {
+            command: Command::Ping,
+            cluster: self.cluster,
+            view: self.view,
+            op: monotonic,
+            ..Header::default()
+        };
 
         self.broadcast_header(header).await;
     }
@@ -1258,12 +1260,14 @@ where
             return;
         }
 
-        let mut header = Header::default();
-        header.command = Command::Commit;
-        header.cluster = self.cluster;
-        header.view = self.view;
-        header.op = self.op;
-        header.commit = self.commit;
+        let header = Header {
+            command: Command::Commit,
+            cluster: self.cluster,
+            view: self.view,
+            op: self.op,
+            commit: self.commit,
+            ..Header::default()
+        };
 
         self.broadcast_header(header).await;
     }
@@ -1393,10 +1397,12 @@ where
     }
 
     async fn send_start_view_change(&mut self) {
-        let mut header = Header::default();
-        header.command = Command::StartViewChange;
-        header.cluster = self.cluster;
-        header.view = self.view;
+        let header = Header {
+            command: Command::StartViewChange,
+            cluster: self.cluster,
+            view: self.view,
+            ..Default::default()
+        };
         self.broadcast_header(header).await;
     }
 
@@ -1418,18 +1424,18 @@ where
             cursor += size;
         }
 
-        let mut header = Header::default();
-        header.command = Command::DoViewChange;
-        header.cluster = self.cluster;
-        header.view = self.view;
-        header.op = self.op;
-        header.commit = self.commit;
-        header.offset = self.view_normal as u64;
-
         let leader = self.leader_index(self.view);
-        header.replica = self.replica_id;
-        header.size = cursor as u32;
-        *message.header_mut() = header;
+        *message.header_mut() = Header {
+            command: Command::DoViewChange,
+            cluster: self.cluster,
+            view: self.view,
+            op: self.op,
+            commit: self.commit,
+            offset: self.view_normal as u64,
+            replica: self.replica_id,
+            size: cursor as u32,
+            ..Default::default()
+        };
         message.update_checksums();
 
         let stored = message.clone_from_pool();
@@ -1457,15 +1463,16 @@ where
             cursor += size;
         }
 
-        let mut header = Header::default();
-        header.command = Command::StartView;
-        header.cluster = self.cluster;
-        header.view = self.view;
-        header.op = self.op;
-        header.commit = self.commit;
-        header.replica = self.replica_id;
-        header.size = cursor as u32;
-        *message.header_mut() = header;
+        *message.header_mut() = Header {
+            command: Command::StartView,
+            cluster: self.cluster,
+            view: self.view,
+            op: self.op,
+            commit: self.commit,
+            replica: self.replica_id,
+            size: cursor as u32,
+            ..Default::default()
+        };
         message.update_checksums();
 
         let mut messages = Vec::new();

@@ -134,14 +134,14 @@ impl Cluster {
             .zip(self.replica_receivers.iter_mut())
             .enumerate()
         {
-            if let Some(downtime) = self.replica_failures.get_mut(index) {
-                if *downtime > 0 {
-                    *downtime = downtime.saturating_sub(1);
-                    while let Ok(msg) = rx.try_recv() {
-                        drop(msg);
-                    }
-                    continue;
+            if let Some(downtime) = self.replica_failures.get_mut(index)
+                && *downtime > 0
+            {
+                *downtime = downtime.saturating_sub(1);
+                while let Ok(msg) = rx.try_recv() {
+                    drop(msg);
                 }
+                continue;
             }
 
             loop {

@@ -89,7 +89,7 @@ impl SimulatedStorage {
     }
 
     fn assert_bounds_and_alignment(&self, buffer: &[u8], offset: u64) {
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
         assert_eq!(buffer.len() % config::SECTOR_SIZE, 0);
         assert_eq!(offset % config::SECTOR_SIZE as u64, 0);
         assert_eq!(buffer.as_ptr() as usize % config::SECTOR_SIZE, 0);
@@ -109,7 +109,7 @@ pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> 
         }],
         2 => vec![
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 4 * message_size_max,
             },
             FaultyAreas {
@@ -119,7 +119,7 @@ pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> 
         ],
         3 => vec![
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 6 * message_size_max,
             },
             FaultyAreas {
@@ -133,11 +133,11 @@ pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> 
         ],
         4 => vec![
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 4 * message_size_max,
             },
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 4 * message_size_max,
             },
             FaultyAreas {
@@ -151,11 +151,11 @@ pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> 
         ],
         5 => vec![
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 6 * message_size_max,
             },
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 6 * message_size_max,
             },
             FaultyAreas {
@@ -173,11 +173,11 @@ pub fn generate_faulty_areas(rng: &mut StdRng, size: u64, replica_count: u8) -> 
         ],
         6 => vec![
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 6 * message_size_max,
             },
             FaultyAreas {
-                first_offset: 0 * message_size_max,
+                first_offset: 0,
                 period: 6 * message_size_max,
             },
             FaultyAreas {

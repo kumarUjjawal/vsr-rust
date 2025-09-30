@@ -1,4 +1,5 @@
 use crate::{config, vsr::Header};
+use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -45,10 +46,14 @@ pub struct Message {
 }
 
 impl Message {
-    fn new() -> Self {
-        Message {
-            buffer: [0; MESSAGE_SIZE_MAX_PADDED],
+    fn new() -> Box<Self> {
+        // Allocate directly on the heap so we never construct the large buffer on the stack.
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        if ptr.is_null() {
+            handle_alloc_error(layout);
         }
+        unsafe { Box::from_raw(ptr as *mut Self) }
     }
 
     pub fn header(&self) -> &Header {
@@ -168,7 +173,7 @@ impl MessagePool {
         let mut free_list = Vec::with_capacity(messages_max);
 
         for _ in 0..messages_max {
-            free_list.push(Box::new(Message::new()));
+            free_list.push(Message::new());
         }
 
         Self {

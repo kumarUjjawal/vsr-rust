@@ -693,11 +693,7 @@ where
             }
         }
 
-        let mut next = self.commit + 1;
-        while next <= target_commit {
-            self.apply_commit(next, None, false).await;
-            next += 1;
-        }
+        self.commit_range(target_commit).await;
 
         if message.header().op > self.op {
             self.op = message.header().op;

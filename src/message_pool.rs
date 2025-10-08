@@ -8,16 +8,16 @@ const MESSAGE_SIZE_MAX_PADDED: usize = config::MESSAGE_SIZE_MAX + config::SECTOR
 pub const MESSAGES_MAX_REPLICA: usize = {
     let mut sum = 0;
 
-    sum += config::IO_DEPTH_READ + config::IO_DEPTH_WRITE; // Journal I/O
-    sum += config::CLIENTS_MAX; // Replica.client_table
-    sum += 1; // Replica.loopback_queue
-    sum += config::PIPELINING_MAX; // Replica.pipeline
-    sum += config::REPLICAS_MAX; // Replica.do_view_change_from_all_replicas quorum
-    sum += config::CONNECTION_MAX; // Connection.recv_message
-    sum += config::CONNECTION_MAX * config::CONNECTION_SEND_QUEUE_MAX_REPLICA; // Connection.send_queue
-    sum += 1; // Handle bursts (e.g. Connection.parse_message)
-    sum += 1; // Handle Replica.commit_op's reply
-    sum += 20; // Network simulator allows up to 20 messages for path_capacity_max
+    sum += config::IO_DEPTH_READ + config::IO_DEPTH_WRITE;
+    sum += config::CLIENTS_MAX;
+    sum += 1;
+    sum += config::PIPELINING_MAX;
+    sum += config::REPLICAS_MAX;
+    sum += config::CONNECTION_MAX;
+    sum += config::CONNECTION_MAX * config::CONNECTION_SEND_QUEUE_MAX_REPLICA;
+    sum += 1;
+    sum += 1;
+    sum += 20;
 
     sum
 };
@@ -25,11 +25,11 @@ pub const MESSAGES_MAX_REPLICA: usize = {
 pub const MESSAGES_MAX_CLIENT: usize = {
     let mut sum = 0;
 
-    sum += config::REPLICAS_MAX; // Connection.recv_message
-    sum += config::REPLICAS_MAX * config::CONNECTION_SEND_QUEUE_MAX_CLIENT; // Connection.send_queue
-    sum += config::CLIENT_REQUEST_QUEUE_MAX; // Client.request_queue
-    sum += 1; // Handle bursts
-    sum += 20; // Network simulator
+    sum += config::REPLICAS_MAX;
+    sum += config::REPLICAS_MAX * config::CONNECTION_SEND_QUEUE_MAX_CLIENT;
+    sum += config::CLIENT_REQUEST_QUEUE_MAX;
+    sum += 1;
+    sum += 20;
 
     sum
 };
@@ -47,7 +47,6 @@ pub struct Message {
 
 impl Message {
     fn new() -> Box<Self> {
-        // Allocate directly on the heap so we never construct the large buffer on the stack.
         let layout = Layout::new::<Self>();
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
@@ -79,7 +78,6 @@ impl Message {
     }
 
     pub fn update_checksums(&mut self) {
-        // First, we create the body slice. The immutable borrow for this ends immediately.
         let body_slice = {
             let header_size = std::mem::size_of::<Header>();
             let total_size = self.header().size as usize;
@@ -87,14 +85,11 @@ impl Message {
             &self.buffer[header_size..header_size + body_size]
         };
 
-        // Calculate the body checksum with no active borrows on `self`.
         let body_checksum = Header::calculate_checksum_body(body_slice);
 
-        // Now, create a mutable borrow of the header to update it.
         let header = self.header_mut();
         header.checksum_body = body_checksum;
 
-        // The `calculate_checksum` method on Header borrows the header, not the whole message.
         header.checksum = header.calculate_checksum();
     }
 }

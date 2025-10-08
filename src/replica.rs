@@ -55,7 +55,6 @@ impl QuorumCounter {
 
 /// The core Replica state machine that implements the Viewstamped Replication protocol.
 pub struct Replica<MB: MessageBus, SM: StateMachine, S: Storage, T: TimeSource> {
-    // Core Dependencies (Generic over Traits)
     message_bus: Arc<MB>,
     message_pool: MessagePool,
     journal: Journal<S>,
@@ -65,38 +64,32 @@ pub struct Replica<MB: MessageBus, SM: StateMachine, S: Storage, T: TimeSource> 
     log: BTreeMap<u64, PooledMessage>,
     next_journal_offset: u64,
 
-    // Replica Configuration
     cluster: u32,
     replica_count: u8,
     replica_id: u8,
     quorum_replication: u8,
     quorum_view_change: u8,
 
-    // Protocol State
     status: Status,
     view: u32,
     op: u64,
     commit: u64,
 
-    // Leader-Specific State
     client_table: HashMap<u128, ClientTableEntry>,
     pipeline: RingBuffer<Prepare, { config::PIPELINING_MAX }>,
 
-    // View Change State
-    view_normal: u32, // The last view in which status was Normal.
+    view_normal: u32,
     start_view_change_from_other_replicas: QuorumCounter,
     do_view_change_from_all_replicas: Vec<Option<PooledMessage>>,
     start_view_change_quorum: bool,
     do_view_change_quorum: bool,
 
-    // Timeouts
     ping_timeout: Timeout,
     prepare_timeout: Timeout,
     commit_timeout: Timeout,
     normal_status_timeout: Timeout,
     view_change_status_timeout: Timeout,
 
-    // Miscellaneous
     prng: StdRng,
 }
 
@@ -199,7 +192,6 @@ where
         replica
     }
 
-    /// Helper function to determine if this replica is the leader in the current view.
     fn is_leader(&self) -> bool {
         (self.view % self.replica_count as u32) as u8 == self.replica_id
     }
